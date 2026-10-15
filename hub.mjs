@@ -466,7 +466,7 @@ function startTurn(k, content) {
   if (content.reportTo || content.replyTo) t.turnMeta = { reportTo: content.reportTo, replyTo: content.replyTo }; else delete t.turnMeta; // survives a restart
   save();
   clearInterval(s.typing); clearInterval(s.progTick);
-  Object.assign(s, { turnStart: Date.now(), steps: 0, lastTool: '', progMsg: null, progText: '', reportTo: content.reportTo, replyTo: content.replyTo });
+  Object.assign(s, { turnStart: Date.now(), steps: 0, lastTool: '', progMsg: null, progText: '', reportTo: content.reportTo, replyTo: content.replyTo, assigned: content.assigned, nudged: content.nudged, handedOff: false });
   s.progTick = setInterval(() => progressSoon(k), 15000); // keeps the elapsed time moving during long single steps
   progressSoon(k);
   const typing = () => bot.api.sendChatAction(t.chatId, 'typing', { message_thread_id: t.threadId }).catch(() => {});
@@ -484,6 +484,13 @@ async function endTurn(k, err) {
   s.lastBuf = s.buf.trim(); s.buf = ''; s.busy = false; t.busy = false; delete t.turnMeta; delete t.autoResumed; save();
   await send(t.chatId, t.threadId, text);
   refreshSoon(); refreshCardSoon(k, 500);
+  // A task assigned to a 圣旨 must end up in a project topic. If it answered by itself, it gets one firm retry and
+  // the report waits for that retry (prompts alone didn't stop low-effort dispatchers from "just answering").
+  if (t.isDispatcher && s.assigned && !s.handedOff && !s.nudged && !err) {
+    s.queue.unshift(Object.assign([{ type: 'text', text: '你刚才没有把这个任务交给项目话题。规则：派来的任务一律在话题里做。现在就给它起一个简短的英文文件夹名，open_project(path=名字, fresh=true)，再用 handoff 把原任务完整交过去。不要再自己回答，也不要说做不了。' }],
+      { reportTo: s.reportTo, replyTo: s.replyTo, assigned: true, nudged: true }));
+    s.reportTo = s.replyTo = null;
+  }
   if (s.reportTo) { // task came from 上朝: report this turn's result back there
     const to = s.reportTo; s.reportTo = null;
     const head = t.isDispatcher ? `📋 ${groupTitle(t.chatId)} 的圣旨` // acknowledgement: which topic got it (or a direct answer)
@@ -1018,7 +1025,7 @@ async function deliverHandoff(ka, kb, note, byAgent) {
   const a = state.topics[ka], b = state.topics[kb];
   if (a.isDispatcher) {
     const sa = live.get(ka) || {}, { reportTo, replyTo } = sa;
-    sa.replyTo = null; // the topic now owes the result; the dispatcher's own reply no longer does
+    sa.replyTo = null; sa.handedOff = true; // the topic now owes the result; the dispatcher's own reply no longer does
     b.handoffHops = 0; save();
     await send(b.chatId, b.threadId, `📨 ${reportTo ? '来自「上朝」' : '来自「圣旨」'}的任务：\n\n${note}`);
     let sb = live.get(kb);
@@ -1054,7 +1061,7 @@ const topicList = () => Object.entries(state.topics).filter(([, t]) => !t.closed
 async function assignToGroup(groupId, task, fromLabel, replyTo) {
   const g = CFG.groups[String(groupId)], dk = dispatcherKey(Number(groupId), g);
   await send(Number(groupId), undefined, `📨 来自「上朝」的任务（${fromLabel}）：\n${task}`);
-  const content = Object.assign([{ type: 'text', text: `「上朝」派来的任务（${fromLabel}），已经确认要做：直接选好或新开话题 handoff 过去，不要反问用户，也不要说做不了。\n\n${task}` }], { reportTo: CFG.exchange, replyTo });
+  const content = Object.assign([{ type: 'text', text: `「上朝」派来的任务（${fromLabel}），已经确认要做：直接选好或新开话题 handoff 过去，不要反问用户，也不要说做不了。\n\n${task}` }], { reportTo: CFG.exchange, replyTo, assigned: true });
   const s = live.get(dk) || startSession(dk);
   if (s.busy || s.queue.length) s.queue.push(content); else startTurn(dk, content);
   return `posted to「${g.title}」's 圣旨`;
@@ -1708,7 +1715,7 @@ async function installBundle(pm, doc) {
 // Deploys ask for it by creating RESTART_FLAG instead of killing the process mid-turn.
 const RESTART_FLAG = path.join(HOME, 'restart.flag');
 function restartWhenIdle(why) {
-  if ([...live.values()].some(s => s.busy || s.waiting || s.queue.length)) return setTimeout(() => restartWhenIdle(why), 30e3);
+  if ([...live.values()].some(s => s.busy || s.waiting || s.queue.length || s.bg)) return setTimeout(() => restartWhenIdle(why), 30e3);
   log(`restarting (${why})`); process.exit(1);
 }
 
