@@ -1,0 +1,86 @@
+{
+  "machine": "Windows",
+  "tz": "Asia/Shanghai",
+  "defaultRoots": [
+    "D:\\work"
+  ],
+  "groups": {
+    "-1001111111111": {
+      "title": "Claude_A_Win",
+      "agent": "claudeA"
+    },
+    "-1002222222222": {
+      "title": "Claude_B_Win",
+      "agent": "claudeB"
+    },
+    "-1003333333333": {
+      "title": "Codex_Win",
+      "agent": "codex"
+    },
+    "-1004444444444": {
+      "title": "Claude_Mac",
+      "agent": "mac",
+      "owner": "mac-hub"
+    }
+  },
+  "agents": {
+    "claudeA": {
+      "type": "claude",
+      "label": "Claude A",
+      "tokenEnv": "CLAUDE_A_OAUTH_TOKEN",
+      "usageConfigDir": "~/.claude-usage-a",
+      "sidebarDir": null
+    },
+    "claudeB": {
+      "type": "claude",
+      "label": "Claude B",
+      "tokenEnv": "CLAUDE_B_OAUTH_TOKEN",
+      "usageConfigDir": null,
+      "sidebarDir": null
+    },
+    "codex": {
+      "type": "codex",
+      "label": "Codex"
+    }
+  },
+  "commandGroups": {
+    "-1005555555555": {
+      "title": "上朝"
+    }
+  },
+  "exchange": -1005555555555,
+  "commandDefault": "Windows",
+  "commandRoute": {
+    "Mac": "(^|[^a-z])mac([^a-z]|$)|麦克|苹果"
+  },
+  "commandAliases": {
+    "a": {
+      "machine": "Windows",
+      "group": -1001111111111
+    },
+    "b": {
+      "machine": "Windows",
+      "group": -1002222222222
+    },
+    "codex": {
+      "machine": "Windows",
+      "group": -1003333333333
+    },
+    "mac": {
+      "machine": "Mac",
+      "group": -1004444444444
+    }
+  },
+  "peers": {
+    "mac": "Mac"
+  },
+  "watch": [
+    {
+      "machine": "Mac",
+      "label": "Mac Hub"
+    }
+  ],
+  "peerBots": [
+    "Mac_Hub_bot"
+  ]
+}

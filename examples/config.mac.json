@@ -1,0 +1,62 @@
+{
+  "machine": "Mac",
+  "tz": "Asia/Shanghai",
+  "selfUpdate": true,
+  "defaultRoots": [
+    "~/workspace"
+  ],
+  "groups": {
+    "-1004444444444": {
+      "title": "Claude_Mac",
+      "agent": "mac"
+    }
+  },
+  "agents": {
+    "mac": {
+      "type": "claude",
+      "label": "Claude (Mac)",
+      "usageConfigDir": null,
+      "sidebarDir": "~/Library/Application Support/Claude/claude-code-sessions"
+    }
+  },
+  "commandGroups": {
+    "-1005555555555": {
+      "title": "上朝"
+    }
+  },
+  "exchange": -1005555555555,
+  "commandDefault": "Windows",
+  "commandRoute": {
+    "Mac": "(^|[^a-z])mac([^a-z]|$)|麦克|苹果"
+  },
+  "commandAliases": {
+    "a": {
+      "machine": "Windows",
+      "group": -1001111111111
+    },
+    "b": {
+      "machine": "Windows",
+      "group": -1002222222222
+    },
+    "codex": {
+      "machine": "Windows",
+      "group": -1003333333333
+    },
+    "mac": {
+      "machine": "Mac",
+      "group": -1004444444444
+    }
+  },
+  "peers": {
+    "windows": "Windows"
+  },
+  "watch": [
+    {
+      "machine": "Windows",
+      "label": "Windows Hub"
+    }
+  ],
+  "peerBots": [
+    "Windows_Hub_bot"
+  ]
+}
