@@ -9,3 +9,6 @@ inbox/
 prev/
 dispatch/
 *.zip
+.env.dpapi
+good/
+restart.flag

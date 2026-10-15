@@ -34,6 +34,7 @@ if ! grep -q '^TELEGRAM_BOT_TOKEN=..*' "$DEST/.env" 2>/dev/null; then
 fi
 
 NODE="$(command -v node)"
+# stdout would be a second, never-rotated copy of logs/hub-*.log: dropped (stderr kept for crashes).
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -48,7 +49,7 @@ cat > "$PLIST" <<EOF
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>$(dirname "$NODE"):/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
-  <key>StandardOutPath</key><string>$DEST/logs/launchd.out.log</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>$DEST/logs/launchd.err.log</string>
 </dict></plist>
 EOF
