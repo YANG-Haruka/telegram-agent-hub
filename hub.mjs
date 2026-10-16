@@ -289,13 +289,18 @@ async function askButtons(chatId, threadId, html, options, vertical = false, ext
   const msg = await (html.length <= 4000 ? bot.api.sendMessage(chatId, html, { ...o, parse_mode: 'HTML' }) : Promise.reject(new Error('too long')))
     .catch(() => { plain = true; return bot.api.sendMessage(chatId, (html = unhtml(html).slice(0, 3900)), o); });
   state.pendingMsgs.push([chatId, msg.message_id]); save();
-  const value = await new Promise(resolve => { waits.set(id, { resolve, chatId, threadId, msgId: msg.message_id, options, html, plain, choice: !!extra.choice }); extra.onId?.(id); });
+  const value = await new Promise(resolve => { waits.set(id, { resolve, chatId, threadId, msgId: msg.message_id, options, html, plain, choice: !!extra.choice, owner: !!extra.owner }); extra.onId?.(id); });
   return value;
 }
-// Confirms an incoming update / move bundle: asks the owner in DM (or in this machine's first group if the bot can't
-// DM them). Safe default; config confirmBundles=false accepts bundles from the trusted peer bot automatically.
-const askOwner = (html, options) => CFG.confirmBundles === false ? (audit('auto-accept', unhtml(html).split('\n')[0].slice(0, 80)), Promise.resolve(options[0][1])) : askButtons(OWNER, undefined, html, options)
-  .catch(() => askButtons(Number(Object.entries(CFG.groups).find(([, g]) => g.owner !== 'mac-hub')[0]), undefined, html, options));
+// Owner notices and cards go to 上朝, not the DM (bot DMs annoyed the owner; the callback handler checks the tapper is the
+// owner). The DM only without 上朝 or when posting there fails. Notices are silent unless the caller passes
+// disable_notification: false; cards notify. owner: /stop in 上朝 leaves these cards alone.
+const notifyOwner = (text, extra = {}) => { const o = { disable_notification: true, ...extra };
+  return (CFG.exchange ? bot.api.sendMessage(Number(CFG.exchange), text, o) : Promise.reject()).catch(() => bot.api.sendMessage(OWNER, text, o)).catch(() => {}); };
+const askOwnerHere = (html, options, extra = {}) => (CFG.exchange ? askButtons(Number(CFG.exchange), undefined, html, options, false, { ...extra, owner: true }) : Promise.reject())
+  .catch(() => askButtons(OWNER, undefined, html, options, false, extra));
+// Confirms an incoming update / move bundle. Safe default; config confirmBundles=false accepts bundles from the trusted peer bot automatically.
+const askOwner = (html, options) => CFG.confirmBundles === false ? (audit('auto-accept', unhtml(html).split('\n')[0].slice(0, 80)), Promise.resolve(options[0][1])) : askOwnerHere(html, options);
 const unhtml = h => h.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
 export function finishWait(id, i, note) {
   const w = waits.get(id); if (!w) return false;
@@ -353,7 +358,6 @@ async function askPermission(k, toolName, input, opts) {
   const s = live.get(k);
   if (s) { s.waiting++; progressSoon(k); }
   refreshSoon();
-  bot.api.sendMessage(OWNER, `🔐 ${t.title} · ${CFG.agents[t.agent].label} 等你批准 ${toolName}\n${topicLink(t.chatId, t.threadId)}`).catch(() => {});
   // "Allow for this session" = the CLI's own rule suggestions, kept in memory only; never a mode switch.
   const rules = (suggestions || []).filter(x => x.type === 'addRules' || x.type === 'addDirectories').map(x => ({ ...x, destination: 'session' }));
   let wid;
@@ -802,8 +806,8 @@ async function refreshCard(k) {
   }
   const m = await bot.api.sendMessage(t.chatId, text, { message_thread_id: t.threadId, disable_notification: true }).catch(() => null);
   if (!m) return;
-  // Not silent: Telegram Desktop doesn't refresh a topic's pinned bar for silent pins. Happens once per topic.
-  await bot.api.pinChatMessage(t.chatId, m.message_id, { disable_notification: false }).catch(e => log('card pin failed', e.description || e.message));
+  // Silent: a pin notifies even in a muted group. ponytail: Telegram Desktop may not show the pinned bar until the topic is reopened.
+  await bot.api.pinChatMessage(t.chatId, m.message_id, { disable_notification: true }).catch(e => log('card pin failed', e.description || e.message));
   t.cardMsgId = m.message_id; t.cardText = text; save();
 }
 const cardTimers = new Map();
@@ -951,7 +955,7 @@ function startTurn(k, content, adopted = false) {
   s.busy = true; t.busy = true;
   // origin: 'owner' | 'agent:<topic>' (unset = the owner typed here); depth = agent hops behind this task (see send_to_agent)
   if (content.reportTo || content.replyTo || content.origin) t.turnMeta = { reportTo: content.reportTo, replyTo: content.replyTo, origin: content.origin, depth: content.depth }; else delete t.turnMeta; // survives a restart
-  save();
+  markMirror(t); save();
   clearInterval(s.typing); clearInterval(s.progTick);
   Object.assign(s, { turnStart: Date.now(), steps: 0, lastTool: '', progMsg: null, progText: '', reportTo: content.reportTo, replyTo: content.replyTo, origin: content.origin, depth: content.depth, assigned: content.assigned, nudged: content.nudged, handedOff: false, handedTo: null, afterTurn: content.afterTurn, sentFiles: new Set() });
   s.progTick = setInterval(() => progressSoon(k), 15000); // keeps the elapsed time moving during long single steps
@@ -980,7 +984,7 @@ async function endTurn(k, err) {
   // Files and the end snapshot too: a message arriving while the answer is sent starts the next turn, which changes files.
   const files = t.isDispatcher || CFG.autoSendFiles === false ? [] : turnFiles(t.cwd, s.turnStart || Date.now(), t.outputs, s.sentFiles), before = s.before, after = snapTree(s, t);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
-  s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; save();
+  s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save();
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
   // resumes the transcript); whatever was queued since goes to the fresh session.
   if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
@@ -1097,7 +1101,7 @@ function checkUsageAlert(agent, u) {
     staleSince[agent] ??= Date.now();
     if (Date.now() - staleSince[agent] > 2 * 3600e3 && !staleWarned.has(agent)) {
       staleWarned.add(agent); log('usage stale', agent);
-      bot.api.sendMessage(OWNER, `⚠️ ${CFG.agents[agent].label} 的用量已经 2 小时读不到新数据，面板上是旧数字，「用量 ≥90%」提醒暂时不会响。可能是 SDK 更新改了用量接口，看 Hub 日志里的 usage fetch failed。`).catch(() => {});
+      notifyOwner(`⚠️ ${CFG.agents[agent].label} 的用量已经 2 小时读不到新数据，面板上是旧数字，「用量 ≥90%」提醒暂时不会响。可能是 SDK 更新改了用量接口，看 Hub 日志里的 usage fetch failed。`);
     }
   } else { delete staleSince[agent]; staleWarned.delete(agent); }
   const r = u?.rate_limits, limit = CFG.usageAlert ?? 90;
@@ -1112,9 +1116,9 @@ function checkUsageAlert(agent, u) {
     const other = claudeAccounts().find(a => a !== agent && !authBad.has(a));
     const mine = Object.entries(state.topics).filter(([, t]) => !t.closed && accountOf(t) === agent);
     const msg = `⚠️ <b>${esc(CFG.agents[agent].label)}</b> ${label}用量已到 ${Math.round(w.utilization)}%${w.resets_at ? `（${fmtWhen(w.resets_at)} 重置）` : ''}。`;
-    if (!other || !mine.length) { bot.api.sendMessage(OWNER, msg, { parse_mode: 'HTML' }).catch(() => {}); continue; }
+    if (!other || !mine.length) { notifyOwner(msg, { parse_mode: 'HTML' }); continue; }
     alerting.add(id);
-    askButtons(OWNER, undefined, `${msg}\n要把它的 ${mine.length} 个会话切到 <b>${esc(CFG.agents[other].label)}</b> 继续吗？（对话和记忆不变）`, [[`切到 ${CFG.agents[other].label}`, 'y'], ['先不用', 'n']])
+    askOwnerHere(`${msg}\n要把它的 ${mine.length} 个会话切到 <b>${esc(CFG.agents[other].label)}</b> 继续吗？（对话和记忆不变）`, [[`切到 ${CFG.agents[other].label}`, 'y'], ['先不用', 'n']])
       .then(v => { if (v === 'y') for (const [kk] of mine) switchAccount(kk, other); }).finally(() => alerting.delete(id));
   }
 }
@@ -1133,7 +1137,7 @@ function noteAuth(t, bad) {
   state.authWarned ??= {};
   if (state.authWarned[acct] === dayKey()) return; // once per account per day
   state.authWarned[acct] = dayKey(); save();
-  bot.api.sendMessage(OWNER, `🔑 ${CFG.agents[acct].label} 登录失效（令牌过期或被撤销），这个账号的会话都跑不了。${reloginHint(acct)}`).catch(() => {});
+  notifyOwner(`🔑 ${CFG.agents[acct].label} 登录失效（令牌过期或被撤销），这个账号的会话都跑不了。${reloginHint(acct)}`, { disable_notification: false });
 }
 // config agents[x].tokenIssued ("YYYY-MM-DD", optional): warned 30 and 7 days before the token's 1-year expiry.
 export const tokenDaysLeft = (issued, now = Date.now()) => Math.ceil((Date.parse(issued) + 365 * 86400e3 - now) / 86400e3);
@@ -1163,14 +1167,14 @@ function dailyChecks() {
   pruneOld(INBOX, 30); pruneOld(path.join(HOME, 'logs'), 30); pruneTemp();
   // Claude Code deletes transcripts idle longer than cleanupPeriodDays (default 30): an old topic would come back without its memory.
   let days; try { days = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'settings.json'), 'utf8').replace(/^﻿/, '')).cleanupPeriodDays; } catch {}
-  if (!(days >= 365)) bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine}：~/.claude/settings.json 的 cleanupPeriodDays ${days == null ? '没设（默认 30 天）' : `是 ${days}`}。Claude Code 会删掉超过这个天数没动过的对话记录，放久了的话题就接不上、记忆也没了。建议加上 "cleanupPeriodDays": 3650。`).catch(() => {});
+  if (!(days >= 365)) notifyOwner(`⚠️ ${CFG.machine}：~/.claude/settings.json 的 cleanupPeriodDays ${days == null ? '没设（默认 30 天）' : `是 ${days}`}。Claude Code 会删掉超过这个天数没动过的对话记录，放久了的话题就接不上、记忆也没了。建议加上 "cleanupPeriodDays": 3650。`);
   for (const [a, c] of Object.entries(CFG.agents)) {
     if (!c.tokenIssued) continue;
     const left = tokenDaysLeft(c.tokenIssued), stage = left <= 7 ? 7 : left <= 30 ? 30 : 0;
     state.tokenWarned ??= {};
     if (!stage || state.tokenWarned[a] === `${c.tokenIssued}:${stage}`) continue;
     state.tokenWarned[a] = `${c.tokenIssued}:${stage}`; save();
-    bot.api.sendMessage(OWNER, `🔑 ${c.label} 的登录令牌${left > 0 ? `还有 ${left} 天到期` : '已经到期'}（${c.tokenIssued} 发的，有效一年）。${reloginHint(a)}`).catch(() => {});
+    notifyOwner(`🔑 ${c.label} 的登录令牌${left > 0 ? `还有 ${left} 天到期` : '已经到期'}（${c.tokenIssued} 发的，有效一年）。${reloginHint(a)}`);
   }
 }
 
@@ -1264,7 +1268,6 @@ function startCodexSession(k) {
         : `${ch.map((c, i) => { const sec = SECRET_FILE.test(path.basename(c.path || ''));
           return i < 4 ? `${esc(c.path || '')}\n<pre>${esc(cut(sec ? maskValues(c.diff) : c.diff, 20, 700))}</pre>${sec ? MASKED : ''}` : esc(c.path || ''); }).join('\n')}${ch.length > 4 ? `\n（后 ${ch.length - 4} 个文件的改动请在电脑上看）` : ''}${pr.reason ? `\n${esc(pr.reason)}` : ''}`;
       s.waiting++; progressSoon(k); refreshSoon();
-      bot.api.sendMessage(OWNER, `🔐 ${t.title} · Codex 等你批准\n${topicLink(t.chatId, t.threadId)}`).catch(() => {});
       try {
         const v = await askButtons(t.chatId, t.threadId, `🔐 <b>${isCmd ? '运行命令' : '修改文件'}</b> · ${esc(t.title)} · Codex\n${body}`,
           [['✅ 允许一次', 'accept'], ['🔁 本会话都允许', 'acceptForSession'], ['❌ 拒绝', 'decline']]);
@@ -1375,7 +1378,7 @@ async function createTopic(chatId, agent, cwd, sessionId, wanted) {
   const ft = await bot.api.createForumTopic(chatId, title);
   const k = key(chatId, ft.message_thread_id);
   state.topics[k] = { chatId, threadId: ft.message_thread_id, agent, cwd, sessionId: sessionId || null, title, busy: false };
-  save();
+  markMirror(state.topics[k]); save();
   return state.topics[k];
 }
 // ---------- recap: show a resumed / copied conversation's memory in Telegram ----------
@@ -1384,18 +1387,51 @@ async function createTopic(chatId, agent, cwd, sessionId, wanted) {
 const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command-message|command-args|local-command-\w+)>|Caveat: |\[Request interrupted|This session is being continued|Hub 刚才重启|刚才额度用完|这是你用 send_to_agent 派出去的任务的结果|你刚才没有把这个任务交给项目话题)/;
 const HUB_WRAP = /^(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)\s*/;
 // The last n exchanges of a transcript (getSessionMessages order): what the user sent, and the assistant's final text before
-// the next user message. Tool calls / results and subagents are left out.
-export function exchanges(msgs, n = 4) {
+// the next user message. Tool calls / results and subagents are left out. auto: a task notification's turn (the session woke
+// up by itself) is an exchange too, with no user side — unless it came mid-turn (the open exchange has no answer yet).
+export function exchanges(msgs, n = 4, auto = false) {
   const out = []; let cur = null; // answers to an untyped turn (a task notification…) belong to no exchange
   for (const m of msgs) {
     if (m.parent_tool_use_id) continue;
     const c = m.message?.content, blocks = typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : [];
     // The desktop app shows a turn's answer from its wrap_up tool (recap + ask), often with no text block at all.
     const text = blocks.map(b => b.type === 'text' ? b.text : b.type === 'tool_use' && /wrap_up$/.test(b.name) && b.input?.recap ? [b.input.recap, b.input.ask].filter(Boolean).join('\n') : '').filter(Boolean).join('\n').trim();
-    if (m.type === 'user' && blocks.length && !blocks.some(b => b.type === 'tool_result')) out.push(cur = NOT_TYPED.test(text) ? null : { user: text.replace(HUB_WRAP, '') || '（图片 / 文件）', reply: '' });
+    if (m.type === 'user' && blocks.length && !blocks.some(b => b.type === 'tool_result')) {
+      if (!NOT_TYPED.test(text)) out.push(cur = { user: text.replace(HUB_WRAP, '') || '（图片 / 文件）', reply: '' });
+      else if (auto && /^\s*<task-notification>/.test(text)) { if (!cur || cur.reply) out.push(cur = { user: '', auto: true, reply: '' }); }
+      else cur = null;
+    }
     else if (m.type === 'assistant' && text && cur) cur.reply = text;
   }
   return out.filter(Boolean).slice(-n);
+}
+// Desktop → topic mirror: the bytes a transcript grew by → the exchanges finished in them (answered ones only) and how many
+// bytes they used up. Same rows getSessionMessages keeps (no meta / sidechain lines); a partial last line is never used. The
+// last exchange is finished once the assistant ended the turn (end_turn), or it ends on an answer (text / wrap_up) and the caller
+// says the session has settled; until then `used` stops at its user line (read again next time) and `waiting` says an answer
+// is there, pending that settle. ponytail: a rewound / branched transcript is read as one line of history.
+export function mirrorScan(buf, settled) {
+  const rows = [], end = buf.lastIndexOf(10) + 1;
+  for (let at = 0, nl; (nl = buf.indexOf(10, at)) >= 0; at = nl + 1) {
+    let m; try { m = JSON.parse(buf.toString('utf8', at, nl)); } catch { continue; }
+    if ((m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain && !m.teamName) rows.push({ at, m });
+  }
+  const blocks = m => { const c = m.message?.content; return typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []; };
+  let li = -1; rows.forEach((r, i) => { const b = blocks(r.m); if (r.m.type === 'user' && b.length && !b.some(x => x.type === 'tool_result')) li = i; }); // exchanges()' turn start
+  const done = (ex, used, waiting = false) => ({ ex: exchanges(ex.map(r => r.m), Infinity, true).filter(e => e.reply), used, waiting });
+  if (li < 0 || !exchanges([rows[li].m], 1, true).length) return done(rows, end); // nothing is open (an interruption, a compaction…)
+  const tail = rows.slice(li), last = tail.at(-1).m, lb = blocks(last), wrap = b => b.type === 'tool_use' && /wrap_up$/.test(b.name);
+  const wraps = new Set(tail.flatMap(r => blocks(r.m).filter(wrap).map(b => b.id)));
+  const onAnswer = last.type === 'assistant' ? lb.some(b => b.type === 'text' && b.text?.trim() || wrap(b)) && !lb.some(b => b.type === 'tool_use' && !wrap(b))
+    : lb.length > 0 && lb.every(b => b.type === 'tool_result' && wraps.has(b.tool_use_id));
+  const answered = onAnswer && !!exchanges(tail.map(r => r.m), 1, true)[0]?.reply;
+  if (answered && (settled || last.message?.stop_reason === 'end_turn')) return done(rows, end);
+  return done(rows.slice(0, li), rows[li].at, answered);
+}
+// One mirrored exchange as one message (≤ 4000 after escaping: the reply is cut shorter until it fits).
+export function mirrorHtml(e) {
+  const cut = (s, n) => s.length > n ? `${s.slice(0, n).replace(/[\uD800-\uDBFF]$/, '')}…` : s;
+  for (let n = 3000; ; n -= 500) { const h = `${e.auto ? '🖥 桌面（后台任务结束后）：' : `🖥 桌面：\n<b>你：</b>${esc(cut(e.user, 500))}`}\n<b>Claude：</b>${esc(cut(e.reply, Math.max(n, 0)))}`; if (h.length <= 4000 || n <= 0) return h; }
 }
 // One message: head, the exchanges as a collapsed quote (each side cut to 400 chars), tail; oldest dropped until it fits.
 export function introHtml(head, ex, tail = '') {
@@ -1494,7 +1530,7 @@ async function cmdStop(k) {
   s.queue = [];
   // Steered messages the CLI hasn't run yet must not run after /stop: close once the stopped turn ends (see endTurn), or now if idle.
   if (s.steerIds?.size || s.cliQueued) { if (s.busy) s.closeAfter = true; else closeLive(k); }
-  for (const [id, w] of waits) if (w.chatId === t.chatId && w.threadId === t.threadId) finishWait(id, -1, '⏹ 已停止');
+  for (const [id, w] of waits) if (w.chatId === t.chatId && w.threadId === t.threadId && !w.owner) finishWait(id, -1, '⏹ 已停止');
   await s.q.interrupt().catch(() => {});
   await send(t.chatId, t.threadId, '⏹ 已停止当前这一轮，排队的消息已清空。');
 }
@@ -1528,6 +1564,46 @@ function resumeHub(chatId, threadId) {
 const ownGroups = () => Object.entries(CFG.groups).filter(([, g]) => g.owner !== 'mac-hub');
 const claudeGroups = () => Object.entries(CFG.groups).filter(([, g]) => g.owner !== 'mac-hub' && CFG.agents[g.agent]?.type === 'claude');
 const transcriptPath = t => path.join(os.homedir(), '.claude', 'projects', t.cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${t.sessionId}.jsonl`);
+
+// ---------- desktop → topic mirror: what the owner does with a topic's session in the desktop app shows up in the topic ----------
+// t.mirrorAt = transcript bytes already seen (of session t.mirrorSid). Set to the end whenever the hub binds a session or runs a
+// turn on it, so only what happened elsewhere is posted; a new / changed session or an unknown offset starts at the end (no backfill).
+function markMirror(t) {
+  if (!t?.sessionId || t.isDispatcher || isCodex(t)) return;
+  try { t.mirrorAt = fs.statSync(transcriptPath(t)).size; } catch { delete t.mirrorAt; }
+  t.mirrorSid = t.sessionId;
+}
+let mirroring = false;
+async function mirrorDesktop() {
+  if (mirroring || state.paused) return;
+  mirroring = true;
+  let running; // sessions `claude agents` shows mid-turn: asked once per tick, only when a finished-looking turn needs confirming
+  try {
+    for (const [k, t] of Object.entries(state.topics)) {
+      const s = live.get(k);
+      if (!t.sessionId || t.isDispatcher || isCodex(t) || t.deleted || t.closed || t.busy || s?.busy || s?.waiting || s?.queue.length || s?.steerIds?.size || s?.cliQueued) continue;
+      const f = transcriptPath(t);
+      let st; try { st = fs.statSync(f); } catch { continue; }
+      const at = t.mirrorAt;
+      if (t.mirrorSid !== t.sessionId || at == null || st.size < at) { markMirror(t); save(); continue; }
+      if (st.size === at) continue;
+      if (st.size - at > 32 * 1048576) { t.mirrorAt = st.size; save(); await send(t.chatId, t.threadId, '🖥 桌面上新增了很多对话，/history 查看', { disable_notification: true }); continue; }
+      const buf = Buffer.alloc(st.size - at), fd = fs.openSync(f, 'r');
+      try { fs.readSync(fd, buf, 0, buf.length, at); } finally { fs.closeSync(fd); }
+      let r = mirrorScan(buf, false);
+      // Settled = no write for 30 s and not mid-turn on the desktop (a text block can sit there while a long tool call streams).
+      if (r.waiting && Date.now() - st.mtimeMs > 30e3) {
+        running ??= new Set((await externalSessions()).filter(x => x.status === 'busy' || ['working', 'blocked'].includes(x.state)).map(x => x.sessionId));
+        if (!running.has(t.sessionId)) r = mirrorScan(buf, true);
+      }
+      // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
+      if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) continue;
+      t.mirrorAt = at + r.used; save();
+      const msgs = r.ex.length > 3 ? [`🖥 桌面上新增了 ${r.ex.length} 轮对话，/history 查看`] : r.ex.map(mirrorHtml);
+      for (const h of msgs) await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
+    }
+  } finally { mirroring = false; }
+}
 
 // ---------- /move: carry a Claude session (transcript + subagent files + project memory) to the other machine ----------
 // Transport = a zip posted in 上朝 addressed "→ <machine>" (see postToExchange / onPeerMessage).
@@ -1641,7 +1717,7 @@ async function importMove(m, doc, intoId, g) {
     if (backup) log('move: kept diverged transcript as', backup);
     if (existing) {
       const [kk, t] = existing; closeLive(kk);
-      t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; delete t.forkFrom; save(); link = topicLink(t.chatId, t.threadId);
+      t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; delete t.forkFrom; markMirror(t); save(); link = topicLink(t.chatId, t.threadId);
       await sendIntro(t, `📦 这个话题已切换到从 ${meta.from} 搬来的会话「${meta.title}」。`, await loadRecap(t, meta.sessionId), '直接发消息接着聊。');
     } else link = (await openProject(Number(intoId), g.agent, target)).link;
     await send(CFG.exchange, undefined, `📦 已接收从 ${meta.from} 搬来的会话「${meta.title}」${link ? `：${link}` : ''}${codeMissing ? `\n⚠️ 这台电脑上原本没有项目目录，已新建空目录 ${target}。请先把代码同步过来（例如 git clone），否则它只有记忆没有文件。` : ''}`);
@@ -1867,7 +1943,7 @@ async function onPeerKey(pub) {
   keyAsks.add(pub); log(`${from} sent a different pairing key`); audit('pair-changed', from);
   const html = `🔑 ${esc(from)} 的 Hub 发来了<b>新的</b>配对密钥，和记住的不一样。\n可能是那台电脑重装了 Hub / 清了 state.json，也可能是有人拿到了它的 bot token 在冒充。确定是你自己弄的才接受。\n不接受的话，${esc(from)} 发来的任务、结果、搬家包和更新包都会被拒收。`;
   const opts = [['接受新密钥', 'y'], ['拒绝', 'n']];
-  const v = await askButtons(OWNER, undefined, html, opts).catch(() => askButtons(Number(ownGroups()[0][0]), undefined, html, opts)).finally(() => keyAsks.delete(pub));
+  const v = await askOwnerHere(html, opts).finally(() => keyAsks.delete(pub));
   if (v === 'n') { p.rejected = [...p.rejected, pub].slice(-20); save(); }
   if (v !== 'y') return;
   p.peer[from] = pub; p.seen = []; save(); log(`re-paired with ${from}`);
@@ -2234,7 +2310,7 @@ async function onMessage(ctx) {
     for (const u of strangers) await bot.api.banChatMember(chatId, u.id).then(() => bot.api.unbanChatMember(chatId, u.id, { only_if_banned: true }))
       .catch(e => log('remove failed', u.id, e.description || e.message));
     audit('remove', chatId, ...strangers.map(u => u.id));
-    return bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine}：有人加入了「${ctx.chat.title}」（${strangers.map(u => u.username ? '@' + u.username : u.first_name).join('、')}），已移出。是你拉的 bot 的话，先写进 config 的 peerBots 再拉。`).catch(() => {});
+    return notifyOwner(`⚠️ ${CFG.machine}：有人加入了「${ctx.chat.title}」（${strangers.map(u => u.username ? '@' + u.username : u.first_name).join('、')}），已移出。是你拉的 bot 的话，先写进 config 的 peerBots 再拉。`, { disable_notification: false });
   }
   // Another hub's bot in 上朝: only the bots listed in config "peerBots" (username or id) are trusted — anything they send
   // can run tasks or install code here, so an unknown bot added to the group is ignored (fail closed).
@@ -2254,7 +2330,7 @@ async function onMessage(ctx) {
   if (c0 === 'resume_hub') return resumeHub(chatId, m.message_thread_id);
   if (ctx.chat.type === 'private') {
     if (/^\/status/.test(m.text || '')) return cmdStatus(ctx);
-    return ctx.reply('在各个 agent 的群里用 /open、/new 开项目；这里只接收「等你批准」提醒。/status 看全部状态。/panic 紧急停止这台电脑的所有会话，/resume_hub 恢复。');
+    return ctx.reply('在各个 agent 的群里用 /open、/new 开项目；提醒和桌面会话的批准卡片都发在「上朝」群。/status 看全部状态。/panic 紧急停止这台电脑的所有会话，/resume_hub 恢复。');
   }
   if (CFG.commandGroups?.[String(chatId)]) { // 上朝: only the machine the message is meant for answers
     const text = m.text || m.caption || '';
@@ -2293,7 +2369,7 @@ async function onMessage(ctx) {
   if (!g && !CFG.commandGroups?.[String(chatId)] && !seenUnknown.has(chatId)) { // a group we were added to but don't know yet
     seenUnknown.add(chatId);
     log('unknown group', chatId, ctx.chat.title);
-    bot.api.sendMessage(OWNER, `👋 ${CFG.machine} 的 bot 在一个还没配置的群里收到了消息：「${ctx.chat.title}」（id ${chatId}）。`).catch(() => {});
+    notifyOwner(`👋 ${CFG.machine} 的 bot 在一个还没配置的群里收到了消息：「${ctx.chat.title}」（id ${chatId}）。`);
   }
   if (!g || g.owner === 'mac-hub') return;
   if (m.date < Date.now() / 1000 - STALE_SEC) return send(chatId, m.message_thread_id, `这条消息是 ${Math.round((Date.now() / 1000 - m.date) / 60)} 分钟前发的，Hub 当时不在线。需要的话请重发。`);
@@ -2310,7 +2386,7 @@ async function onMessage(ctx) {
   if (cmd?.[1] === 'approvals') return cmdApprovals(chatId, threadId, cmd[2].trim());
   if (cmd?.[1] === 'clear' && !threadId) return cmdClear(chatId, undefined, false);
   if (cmd && ['open', 'new'].includes(cmd[1])) return cmdOpen(ctx, g, cmd[2], cmd[1] === 'new').catch(e => send(chatId, undefined, `⚠️ ${e.message}`));
-  if (cmd?.[1] === 'start') return send(chatId, threadId, '在「圣旨」里直接说你要做什么（比如“继续做 my-app”“新建一个项目 xxx”），或用 /open <目录> 接上已有项目，/new <目录> 开新项目。话题里直接发消息就是跟 agent 对话；图片（一次发多张也算一条）、图片文件、PDF 会直接给 agent 看。agent 正在做的时候再发消息 = 插话：它做完手头这一步就会看到，接着按你说的调整（要立刻打断发 /stop）。\n项目的会话正在电脑桌面 App 里开着时，会复制一份带完整记忆的副本在 Telegram 里继续（桌面那边不受影响），并贴出「📜 之前的对话」；/history [轮数] 取最近的对话记录（默认 10 轮，最多 50）。\n/mode 切换 ask（每个操作都问）/ auto（有风险才问）；/model 切换模型；/effort 调思考强度（按话题，下一轮起生效）；/account 换账号继续（额度快满时用）；/stop 停止当前这一轮；/get <路径> 取文件或文件夹（电脑上任意位置，文件夹打包成 zip；Hub 自己的目录和密钥类文件除外；圣旨里也能用）；/diff 看上一轮改了哪些代码（git 项目）；/screen [编号] 截这台电脑的屏幕（上朝里 /screen mac 截 Mac）；/shot <网址或端口> [宽度] 用无头浏览器截网页（只写端口 = 这台电脑的 localhost）；/status 看状态。\nagent 的回复按 Markdown 排版（代码块、表格、链接等）。每轮结束自动发来这一轮新建 / 改过的图片、PDF、文档等（最多直接发 3 个，多的点按钮取；config autoSendFiles: false 关闭）；git 项目还会附一条「📝 N 个文件 +a −b」改动摘要。\n/sync 把桌面侧边栏的会话同步成话题；/fork 带完整记忆复制到新话题（可换账号）；/handoff 把结论交给另一个话题；/move mac 把会话搬到另一台电脑（加 code 连代码一起带）；/approvals on|off 把这台电脑桌面 App 的权限请求推到手机；/clear（在圣旨里）清空本群消息和话题（记忆保留）。\n/panic 紧急停止这台电脑的所有会话、拒绝所有待批卡片并暂停（私聊、上朝或任何群都能发；在上朝发两台电脑都停）；/resume_hub 恢复。\n两台电脑配对后，跨机派活、结果、搬家包、更新包都带签名，签名不对的拒收；对方换了配对密钥会私聊问你接不接受。\n换令牌：在这台电脑 Hub 目录的 .env 里写一行「名字=新值」再重启 Hub（Windows 上令牌加密存在 .env.dpapi，新值优先用，稳定运行 2 分钟后自动加密搬过去）。');
+  if (cmd?.[1] === 'start') return send(chatId, threadId, '在「圣旨」里直接说你要做什么（比如“继续做 my-app”“新建一个项目 xxx”），或用 /open <目录> 接上已有项目，/new <目录> 开新项目。话题里直接发消息就是跟 agent 对话；图片（一次发多张也算一条）、图片文件、PDF 会直接给 agent 看。agent 正在做的时候再发消息 = 插话：它做完手头这一步就会看到，接着按你说的调整（要立刻打断发 /stop）。\n项目的会话正在电脑桌面 App 里开着时，会复制一份带完整记忆的副本在 Telegram 里继续（桌面那边不受影响），并贴出「📜 之前的对话」；/history [轮数] 取最近的对话记录（默认 10 轮，最多 50）。\n/mode 切换 ask（每个操作都问）/ auto（有风险才问）；/model 切换模型；/effort 调思考强度（按话题，下一轮起生效）；/account 换账号继续（额度快满时用）；/stop 停止当前这一轮；/get <路径> 取文件或文件夹（电脑上任意位置，文件夹打包成 zip；Hub 自己的目录和密钥类文件除外；圣旨里也能用）；/diff 看上一轮改了哪些代码（git 项目）；/screen [编号] 截这台电脑的屏幕（上朝里 /screen mac 截 Mac）；/shot <网址或端口> [宽度] 用无头浏览器截网页（只写端口 = 这台电脑的 localhost）；/status 看状态。\nagent 的回复按 Markdown 排版（代码块、表格、链接等）。每轮结束自动发来这一轮新建 / 改过的图片、PDF、文档等（最多直接发 3 个，多的点按钮取；config autoSendFiles: false 关闭）；git 项目还会附一条「📝 N 个文件 +a −b」改动摘要。\n/sync 把桌面侧边栏的会话同步成话题；/fork 带完整记忆复制到新话题（可换账号）；/handoff 把结论交给另一个话题；/move mac 把会话搬到另一台电脑（加 code 连代码一起带）；/approvals on|off 把这台电脑桌面 App 的权限请求推到手机；/clear（在圣旨里）清空本群消息和话题（记忆保留）。\n/panic 紧急停止这台电脑的所有会话、拒绝所有待批卡片并暂停（私聊、上朝或任何群都能发；在上朝发两台电脑都停）；/resume_hub 恢复。\n两台电脑配对后，跨机派活、结果、搬家包、更新包都带签名，签名不对的拒收；对方换了配对密钥会在上朝问你接不接受。\n换令牌：在这台电脑 Hub 目录的 .env 里写一行「名字=新值」再重启 Hub（Windows 上令牌加密存在 .env.dpapi，新值优先用，稳定运行 2 分钟后自动加密搬过去）。');
   if (cmd?.[1] === 'screen') return cmdScreen(chatId, threadId, cmd[2]).catch(e => send(chatId, threadId, `⚠️ /screen 失败：${e.message}`));
   if (cmd?.[1] === 'shot') return cmdShot(chatId, threadId, cmd[2]).catch(e => send(chatId, threadId, `⚠️ /shot 失败：${e.message}`));
   if (!k) { // 「圣旨」(General): plain requests go to the dispatcher agent
@@ -2473,10 +2549,10 @@ export function hookDecision(v) {
 async function onDesktopPermission(req) {
   if (hubSessionIds().has(req.session_id) || state.paused) return {};
   const where = `${path.basename(req.cwd || '') || '?'} · ${String(req.session_id || '').slice(0, 8)}`;
-  let timer;
-  const p = askButtons(OWNER, undefined, `🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny']]);
+  let timer, wid;
+  const p = askOwnerHere(`🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny']], { onId: id => { wid = id; } });
   const timeout = new Promise(res => { timer = setTimeout(() => {
-    for (const [id, w] of waits) if (w.chatId === OWNER && w.html.includes(esc(where))) finishWait(id, -1, '⌛ 已超时，请回电脑上处理');
+    if (wid) finishWait(wid, -1, '⌛ 已超时，请回电脑上处理');
     res(null);
   }, HOOK_WAIT); });
   const v = await Promise.race([p, timeout]);
@@ -2537,7 +2613,7 @@ async function cmdApprovals(chatId, threadId, arg) {
   if (!j.hooks.PermissionRequest.length) delete j.hooks.PermissionRequest;
   fs.mkdirSync(path.dirname(f), { recursive: true });
   fs.writeFileSync(f, JSON.stringify(j, null, 2));
-  return send(chatId, threadId, on ? `✅ ${CFG.machine}：桌面 App / 终端会话的权限请求会推到你的私聊（5 分钟没点就回电脑上处理）。新开的会话生效。/approvals off 关闭。` : `✅ ${CFG.machine}：已关闭，桌面会话的权限请求回到电脑上处理。`);
+  return send(chatId, threadId, on ? `✅ ${CFG.machine}：桌面 App / 终端会话的权限请求会推到「上朝」群（5 分钟没点就回电脑上处理）。新开的会话生效。/approvals off 关闭。` : `✅ ${CFG.machine}：已关闭，桌面会话的权限请求回到电脑上处理。`);
 }
 function startHookServer() {
   if (!ENV.HUB_HOOK_TOKEN) return;
@@ -2552,7 +2628,7 @@ function startHookServer() {
     });
   }).on('error', e => { // port taken / reserved (Hyper-V): run without desktop approvals instead of crash-looping
     log('permission hook disabled', e.code || e.message);
-    bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine} Hub：权限钩子端口 ${CFG.hookPort || 7788} 不可用（${e.code || e.message}），桌面会话的权限请求暂时只能在电脑上处理。`).catch(() => {});
+    notifyOwner(`⚠️ ${CFG.machine} Hub：权限钩子端口 ${CFG.hookPort || 7788} 不可用（${e.code || e.message}），桌面会话的权限请求暂时只能在电脑上处理。`);
   }).listen(CFG.hookPort || 7788, '127.0.0.1', () => log(`permission hook listening on 127.0.0.1:${CFG.hookPort || 7788}`)));
 }
 
@@ -2585,7 +2661,7 @@ export const peerAgeMin = (desc, now = Date.now(), machine) => {
   const line = machine ? String(desc || '').split('\n').find(l => l.includes(` ${machine} Hub `)) : desc;
   const at = Date.parse(HB_RE.exec(line || '')?.[1] || ''); return at ? (now - at) / 60000 : Infinity;
 };
-// Proactive "peer offline / back online" DMs are opt-in (config peerAlerts: true): a sleeping laptop needs no action, and a
+// Proactive "peer offline / back online" notices are opt-in (config peerAlerts: true): a sleeping laptop needs no action, and a
 // task sent to an offline machine already gets "🏖 … 今天请假了" on the spot.
 async function watchPeers() {
   if (!CFG.peerAlerts) return;
@@ -2595,9 +2671,9 @@ async function watchPeers() {
     if (!Number.isFinite(age)) continue; // never came online yet → nothing to report
     if (down === !!peerDown[w.label]) continue;
     peerDown[w.label] = down;
-    await bot.api.sendMessage(OWNER, down
+    await notifyOwner(down
       ? `⚠️ ${w.label} ${Number.isFinite(age) ? `已经 ${Math.round(age)} 分钟` : '一直'}没有心跳（那台电脑可能关机、睡眠或断网）。恢复后会再通知你。`
-      : `✅ ${w.label} 恢复在线。`).catch(() => {});
+      : `✅ ${w.label} 恢复在线。`);
   }
 }
 
@@ -2616,7 +2692,7 @@ async function installBundle(pm, doc, byOwner = false) {
     if ((!byOwner && doc.file_unique_id === state.lastBundle) || pm.date <= (state.lastBundleAt || 0)) return log('self-update: skipped older bundle', doc.file_unique_id);
     log('self-update: new bundle', doc.file_name, doc.file_unique_id);
     state.lastBundle = doc.file_unique_id; state.lastBundleAt = pm.date; save(); // at most once; failures are reported below
-    const fail = async why => { rmTemp(); log('self-update failed', why); await bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine} Hub 更新失败，已保持原版本：${String(why).slice(0, 300)}`).catch(() => {}); };
+    const fail = async why => { rmTemp(); log('self-update failed', why); await notifyOwner(`⚠️ ${CFG.machine} Hub 更新失败，已保持原版本：${String(why).slice(0, 300)}`); };
     const dir = path.join(os.tmpdir(), `agent-hub-update-${Date.now()}`), prev = path.join(HOME, 'prev');
     let zip;
     const rmTemp = () => { fs.rmSync(dir, { recursive: true, force: true }); if (zip) fs.rmSync(zip, { force: true }); };
@@ -2648,7 +2724,7 @@ async function installBundle(pm, doc, byOwner = false) {
       await npmCi().catch(e2 => log('rollback npm ci failed', e2.message));
       return fail(`npm ci：${e.message}`);
     }
-    await bot.api.sendMessage(OWNER, `🔄 ${CFG.machine} Hub 已从置顶安装包更新，空闲时自动重启生效。`).catch(() => {});
+    await notifyOwner(`🔄 ${CFG.machine} Hub 已从置顶安装包更新，空闲时自动重启生效。`);
     return restartWhenIdle('self-update');
 }
 // Restarts (exit → Task Scheduler / launchd starts us again) only once no turn is running, queued or waiting for a tap and no
@@ -2667,7 +2743,7 @@ function restartWhenIdle(why) {
 function askRestartNow(why) {
   const busy = [...live].filter(([, s]) => s.busy || s.waiting || s.queue.length || s.bg)
     .map(([k, s]) => `· ${state.topics[k]?.title}：${s.waiting ? '等你批准' : s.busy || s.queue.length ? '还在跑' : `${s.bg} 个后台任务`}`);
-  askButtons(OWNER, undefined, `🔄 ${esc(CFG.machine)} Hub 等着重启（${esc(why)}）已经 6 小时，这些话题一直没空下来：\n${esc(busy.join('\n'))}\n现在重启会结束它们的后台任务；在跑的那一轮重启后自动接着做。`, [['现在重启', 'now'], ['继续等', 'wait']])
+  askOwnerHere(`🔄 ${esc(CFG.machine)} Hub 等着重启（${esc(why)}）已经 6 小时，这些话题一直没空下来：\n${esc(busy.join('\n'))}\n现在重启会结束它们的后台任务；在跑的那一轮重启后自动接着做。`, [['现在重启', 'now'], ['继续等', 'wait']])
     .then(v => { if (v === 'now') { log(`restarting (${why}, owner said now)`); setTimeout(() => process.exit(4), 2000); } }, e => log('restart ask failed', e));
 }
 
@@ -2687,10 +2763,10 @@ async function dailyUpdate() {
   const out = await new Promise(res => execFile(process.execPath, [path.join(HOME, 'update.mjs')], { cwd: HOME, windowsHide: true, timeout: 900000 }, (e, so) => res(String(so || e?.message || '').trim().split('\n').pop())));
   sdkUpdating = false;
   log('daily update:', out);
-  if (out.startsWith('rolled-back')) return bot.api.sendMessage(OWNER, `⚠️ Hub 自动更新失败，已退回原版本：${out}`).catch(() => {});
-  if (out.startsWith('rollback-failed')) return bot.api.sendMessage(OWNER, `⚠️ Hub 自动更新失败，退回原版本也没成功（下次重启会用现在装着的版本）：${out}`).catch(() => {});
+  if (out.startsWith('rolled-back')) return notifyOwner(`⚠️ ${CFG.machine} Hub 自动更新失败，已退回原版本：${out}`);
+  if (out.startsWith('rollback-failed')) return notifyOwner(`⚠️ ${CFG.machine} Hub 自动更新失败，退回原版本也没成功（下次重启会用现在装着的版本）：${out}`);
   if (!out.startsWith('updated')) return;
-  await bot.api.sendMessage(OWNER, `🔄 Hub 的 Claude 已自动更新（${out.replace('updated ', '')}），没有任务在跑时会自动重启生效。`).catch(() => {});
+  await notifyOwner(`🔄 ${CFG.machine} Hub 的 Claude 已自动更新（${out.replace('updated ', '')}），没有任务在跑时会自动重启生效。`);
   // The other machine follows with the same SDK: push it the new package-lock.json in a signed bundle (if this hub has a push script).
   const push = path.join(HOME, 'mac', 'push-mac-update.mjs');
   if (fs.existsSync(push)) execFile(process.execPath, [push], { cwd: HOME, windowsHide: true, timeout: 300000 }, (e, so) => log('pushed SDK update to the peer:', String(so || e?.message || '').trim().split('\n').pop()));
@@ -2752,8 +2828,9 @@ if (IS_MAIN) {
   // Turns cut off by a crash / power loss / reboot continue by themselves (once: a turn that keeps killing the hub doesn't loop).
   // The list stays in state until onStart, so an instance that dies before reaching Telegram doesn't forget them.
   state.interrupted = [...new Set([...(state.interrupted || []), ...Object.entries(state.topics).filter(([, t]) => t.busy).map(([k]) => k)])];
-  for (const k of state.interrupted) if (state.topics[k]) state.topics[k].busy = false;
+  for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
   save();
+  setInterval(() => mirrorDesktop().catch(e => log('mirror failed', e)), 20e3);
   process.on('exit', () => {
     for (const job of outgoing) if (job.left.length) keepUnsent(job);
     try { if (fs.readFileSync(PID, 'utf8') === String(process.pid)) fs.unlinkSync(PID); } catch {}
@@ -2765,10 +2842,10 @@ if (IS_MAIN) {
     if (started) return log('poller restarted');
     started = true;
     log(`hub started as @${me.username} v${HUB_VERSION}`); refreshPanels(); heartbeat().then(() => setTimeout(watchPeers, 60e3)); dailyChecks(); announceUnpaired();
-    if (state.paused) bot.api.sendMessage(OWNER, `${pausedNote()}（Hub 刚重启过，仍在暂停中）`).catch(() => {});
-    if (state.rolledBack) { state.rolledBack = false; save(); bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine} Hub 的新版本反复启动失败，已自动退回上一个版本（v${HUB_VERSION}）。`).catch(() => {}); }
+    if (state.paused) notifyOwner(`${pausedNote()}（Hub 刚重启过，仍在暂停中）`, { disable_notification: false });
+    if (state.rolledBack) { state.rolledBack = false; save(); notifyOwner(`⚠️ ${CFG.machine} Hub 的新版本反复启动失败，已自动退回上一个版本（v${HUB_VERSION}）。`); }
     // start-hub.vbs put good/hub.mjs back after 3 quick crashes: the edited version is not running, say so.
-    try { const at = fs.statSync(path.join(HOME, 'logs', 'hub.mjs.crashed')).mtimeMs; if (at > (state.crashRestoredAt || 0)) { state.crashRestoredAt = at; save(); bot.api.sendMessage(OWNER, `⚠️ ${CFG.machine} Hub：新改的 hub.mjs 启动后连崩 3 次，已自动换回上次稳定的版本（v${HUB_VERSION}）。崩的那份在 logs/hub.mjs.crashed，原因看 logs/crash.log。`).catch(() => {}); } } catch {}
+    try { const at = fs.statSync(path.join(HOME, 'logs', 'hub.mjs.crashed')).mtimeMs; if (at > (state.crashRestoredAt || 0)) { state.crashRestoredAt = at; save(); notifyOwner(`⚠️ ${CFG.machine} Hub：新改的 hub.mjs 启动后连崩 3 次，已自动换回上次稳定的版本（v${HUB_VERSION}）。崩的那份在 logs/hub.mjs.crashed，原因看 logs/crash.log。`); } } catch {}
     setTimeout(() => { if (state.verifyUpdate) { state.verifyUpdate = false; state.updateBoots = 0; save(); } if (saveGood() && process.platform === 'win32') sealEnv(); }, 120e3);
     for (const k of state.interrupted.splice(0)) {
       const t = state.topics[k];

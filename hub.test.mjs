@@ -389,3 +389,49 @@ test('recap: typed user turns and the final assistant text per exchange; noise l
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(introHtml('h', [{ user: `${'a'.repeat(399)}😀`, reply: '' }]))); // cut never splits an emoji
   assert.match(historyMd('p', [{ user: 'q', reply: '' }]), /^# p：最近 1 轮对话\n\n## 1\n\n\*\*你：\*\*\n\nq\n\n\*\*Claude：\*\*\n\n（没有文字回复）$/);
 });
+
+import { mirrorScan, mirrorHtml } from './hub.mjs';
+test('desktop mirror: new transcript bytes → finished exchanges and the bytes they used', () => {
+  const L = o => JSON.stringify(o) + '\n', B = (...ls) => Buffer.from(ls.join(''));
+  const u = c => L({ type: 'user', message: { role: 'user', content: c } });
+  const a = (stop, ...c) => L({ type: 'assistant', message: { role: 'assistant', content: c, stop_reason: stop } });
+  const text = t => ({ type: 'text', text: t });
+  const ex1 = [u('改一下标题'), a(null, text('我看看'), { type: 'tool_use', id: 't1', name: 'Edit', input: {} }), u([{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }]), a('end_turn', text('改好了'))];
+  // A finished exchange (end_turn), noise skipped (meta / sidechain / file-history lines), partial last line left for next time.
+  const noise = [L({ type: 'user', isMeta: true, message: { content: 'Base directory for this skill' } }), L({ type: 'assistant', isSidechain: true, message: { content: [text('sub')] } }), L({ type: 'file-history-snapshot' })];
+  const partial = '{"type":"user","message":{"content":"下一';
+  let buf = B(...ex1, ...noise, partial), r = mirrorScan(buf, false);
+  assert.deepEqual(r.ex, [{ user: '改一下标题', reply: '改好了' }]);
+  assert.equal(r.used, buf.length - Buffer.byteLength(partial)); // byte offsets, not characters (中文 = 3 bytes)
+  // Unfinished: mid tool call → nothing, the offset stays at its user line; earlier finished ones still go.
+  const open = [u('再跑一下测试'), a(null, text('跑一下'), { type: 'tool_use', id: 't2', name: 'Bash', input: {} })];
+  buf = B(...ex1, ...open); r = mirrorScan(buf, true);
+  assert.deepEqual(r.ex.map(e => e.user), ['改一下标题']);
+  assert.equal(r.used, Buffer.byteLength(ex1.join('')));
+  assert.equal(r.waiting, false);
+  // Ends on text without end_turn: waits until the caller says the session settled.
+  buf = B(u('就这样？'), a(null, text('对。'))); r = mirrorScan(buf, false);
+  assert.deepEqual([r.ex, r.used, r.waiting], [[], 0, true]);
+  assert.deepEqual(mirrorScan(buf, true), { ex: [{ user: '就这样？', reply: '对。' }], used: buf.length, waiting: false });
+  // Desktop app: the answer is in wrap_up; its tool_result after it still counts as the end.
+  buf = B(u('看看'), a(null, { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '看完了' } }), u([{ type: 'tool_result', tool_use_id: 'w', content: '' }]));
+  assert.deepEqual(mirrorScan(buf, true).ex, [{ user: '看看', reply: '看完了' }]);
+  // Only a user line so far / no answer before the next one (interrupted): not posted.
+  assert.deepEqual(mirrorScan(B(u('在吗')), true), { ex: [], used: 0, waiting: false });
+  buf = B(u('算了'), u('[Request interrupted by user]')); r = mirrorScan(buf, false);
+  assert.deepEqual([r.ex, r.used], [[], buf.length]); // the interruption opens nothing typed
+  // The session woke up by itself (background task done): posted with no user side; a notification mid-turn stays in that turn.
+  const tn = u('<task-notification> <task-id>b1</task-id> done');
+  buf = B(tn, a('end_turn', text('练完了，对比如下'))); r = mirrorScan(buf, false);
+  assert.deepEqual(r.ex, [{ user: '', auto: true, reply: '练完了，对比如下' }]);
+  assert.equal(mirrorHtml(r.ex[0]), '🖥 桌面（后台任务结束后）：\n<b>Claude：</b>练完了，对比如下');
+  assert.deepEqual(mirrorScan(B(tn, a(null, text('跑一下'), { type: 'tool_use', id: 't3', name: 'Bash', input: {} })), true), { ex: [], used: 0, waiting: false });
+  assert.deepEqual(mirrorScan(B(u('等它'), tn, a('end_turn', text('好了'))), false).ex, [{ user: '等它', reply: '好了' }]);
+  assert.deepEqual(exchanges([JSON.parse(tn), JSON.parse(a('end_turn', text('x')))]), []); // recaps still skip them
+  // Lines belonging to a turn already used up (late writes), and nothing at all.
+  assert.deepEqual(mirrorScan(B(a('end_turn', text('late'))), false), { ex: [], used: Buffer.byteLength(a('end_turn', text('late'))), waiting: false });
+  assert.deepEqual(mirrorScan(Buffer.alloc(0), false), { ex: [], used: 0, waiting: false });
+  // One message per exchange, escaped and cut to fit.
+  assert.equal(mirrorHtml({ user: '<a>', reply: 'b&c' }), '🖥 桌面：\n<b>你：</b>&lt;a&gt;\n<b>Claude：</b>b&amp;c');
+  assert.ok(mirrorHtml({ user: 'q', reply: '<'.repeat(9000) }).length <= 4000);
+});

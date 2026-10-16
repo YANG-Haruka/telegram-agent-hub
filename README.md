@@ -34,6 +34,8 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 - Per-turn change summary for git projects (「📝 N files +a −b」, via a temporary index — your staging area is never touched); `/diff` sends the full diff of the last turn, secret files masked.
 - Steering: a message sent while the agent is working goes straight into the running turn (Claude: `priority: 'next'`, read after the current step; Codex: `turn/steer`) — 「💬 已插话」 instead of queuing. `/stop` still interrupts at once; hub-fed work (handoffs, relays) still queues.
 - Memory takeover: if a project's latest session is open in the desktop app, the topic continues from a copy with the full memory (marked ⑂) instead of asking; an existing topic whose session is open on the desktop offers 「📋 复制一份在这里继续」. Topics started from an existing conversation show 「📜 之前的对话」 (the last few exchanges, collapsed); `/history [n]` sends up to 50 as a Markdown file.
+- Desktop → topic sync: when you keep chatting with a topic's session in the desktop app / terminal, each finished exchange (your message + the final reply) is posted to the topic as 「🖥 桌面：」, silently; replies a session gives on its own after a background task finishes are posted too. More than 3 at once → one line pointing to `/history`. Nothing older than the binding is backfilled. Claude project topics only.
+- Notices and approval cards go to 上朝, never the bot DM (the DM is only a fallback when 上朝 isn't configured or posting fails); plain notices are silent. Topic card pins are silent too, since Telegram notifies pins even in muted groups.
 - `/screen [n]` screenshots this machine's desktop; `/shot <url|port> [width]` screenshots a web page with the installed Edge/Chrome in headless mode. Owner only, no AI, no quota; in 上朝 `/screen mac` asks the Mac.
 
 **Projects and sessions**
@@ -54,13 +56,13 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 
 **Permissions and safety**
 - Risky actions arrive as cards — *allow once* / *allow for this session* / *deny*, with the command or diff shown (secret files masked). Default mode `auto` (only risky actions ask); `/mode ask|auto` per topic or group. No full-bypass mode from Telegram.
-- `/approvals on` routes permission prompts of Claude Desktop / terminal sessions on that machine to your private chat (it adds an HTTP hook to `~/.claude/settings.json`; 5 minutes without a tap → handle it at the computer). `/approvals on mac` in 上朝 does it on the Mac.
+- `/approvals on` routes permission prompts of Claude Desktop / terminal sessions on that machine to buttons in 上朝 (it adds an HTTP hook to `~/.claude/settings.json`; 5 minutes without a tap → handle it at the computer). `/approvals on mac` in 上朝 does it on the Mac.
 - `/panic` (private chat, 上朝 or any group): stops every session on the machine (in 上朝: on both), denies pending cards, clears queues and auto-resumes, and keeps the hub paused across restarts — nothing new runs, no peer tasks or bundles are accepted. `/resume_hub` ends it.
 - Signed cross-machine messages (see *Security*), DPAPI-encrypted secrets on Windows, secret redaction, stranger removal, append-only audit log.
 
 **Operations**
 - Autostart (Task Scheduler + `start-hub.vbs` / launchd), watchdog (reconnects first, restarts only when idle), heartbeats in group descriptions (no proactive offline alerts: a task sent to an offline machine gets 「🏖 … 今天请假了」; `peerAlerts: true` opts in), replies that failed to send are retried every minute.
-- Crash-loop guard: 3 crashes within 2 minutes of starting → the last version that ran 2 stable minutes (`good/hub.mjs`) is put back, the bad one kept as `logs/hub.mjs.crashed`, and you get a DM.
+- Crash-loop guard: 3 crashes within 2 minutes of starting → the last version that ran 2 stable minutes (`good/hub.mjs`) is put back, the bad one kept as `logs/hub.mjs.crashed`, and you are told in 上朝.
 - Deploy without cutting a turn: create `restart.flag` next to `hub.mjs`; the hub restarts once every topic is idle (asks you after 6 hours).
 - Daily Agent SDK update at `updateHour` when idle — only releases ≥ 3 days old, self-test plus a real turn per account, rolled back on failure.
 - Remote update of the other machine (`scripts/push-update.mjs`), checked and rolled back automatically after 3 quick crashes.
@@ -81,7 +83,7 @@ UI text is Chinese (pinned panels are English). Contributions for other language
 2. **Groups**
    - For each agent account: a supergroup with *Topics* enabled. Add that machine's bot as admin (manage topics, pin, delete messages, ban users, change group info).
    - One command group (上朝): you plus every machine's bot, all bots as admins.
-   - Your numeric user id: e.g. ask @userinfobot. Group ids: start the hub and write something in a group it doesn't know yet — it DMs you the id.
+   - Your numeric user id: e.g. ask @userinfobot. Group ids: start the hub and write something in a group it doesn't know yet — it tells you the id (in 上朝; by DM until 上朝 is configured).
 3. **Config** — `cp .env.example .env` and `cp examples/config.windows.json config.json` (or `config.mac.json`), then fill in ids, nicknames, folders and the other hub's bot in `peerBots`. See *Config* below.
 4. **Claude accounts**
    - Each account the machine should drive: log in as that account and run `claude setup-token`; put the token in `.env` under the name `agents.<id>.tokenEnv` says. A machine that only uses its own login needs no token.
@@ -124,7 +126,7 @@ UI text is Chinese (pinned panels are English). Contributions for other language
 | `commandDefault` | machine that answers unnamed 上朝 messages (chief dispatcher) |
 | `commandRoute` | `{ Machine: regex }` keywords that route an unnamed message to that machine |
 | `commandAliases` | `{ nickname: { machine, group } }` |
-| `peers`, `watch` | the other machine(s); heartbeat watching (`peerAlerts: true` = DM when a peer goes offline / comes back) |
+| `peers`, `watch` | the other machine(s); heartbeat watching (`peerAlerts: true` = a notice in 上朝 when a peer goes offline / comes back) |
 | `peerBots` | the other hub's bot (username or numeric id). Only these bots are trusted in the command group and allowed in your groups — required for anything cross-machine |
 | `selfUpdate` | accept update bundles from the other machine |
 | `confirmBundles` | default: you tap to accept each update / move bundle; `false` = accept automatically from `peerBots` (a changed pairing key always needs your tap) |
@@ -140,9 +142,9 @@ UI text is Chinese (pinned panels are English). Contributions for other language
 
 ## Security
 
-- **Owner only.** The hub obeys only `OWNER_ID`. Anyone else added to your groups (whoever added them) is removed at once and you get a DM; only you, this machine's bot and `peerBots` may stay.
+- **Owner only.** The hub obeys only `OWNER_ID`. Anyone else added to your groups (whoever added them) is removed at once and you are told in 上朝; only you, this machine's bot and `peerBots` may stay.
 - **Signed cross-machine messages.** Each hub keeps an X25519 key in `state.json` (not `.env`). The hubs exchange public keys in 上朝 the first time they meet (「🔑 → Mac …」, trust on first use) and HMAC every task, result, move bundle and update bundle with the derived key (last line `#sig …`; bundles are signed together with the file's SHA-256 and verified before unpacking). Unsigned, wrong, older than 10 minutes or replayed → rejected (🚫 in 上朝, logged and audited). A stolen bot token alone can't run tasks or install code.
-  - **Changed key** (reinstalled hub, cleared `state.json` — or an impostor): never accepted automatically; you get *accept new key / reject* in private chat.
+  - **Changed key** (reinstalled hub, cleared `state.json` — or an impostor): never accepted automatically; you get *accept new key / reject* in 上朝 (only your own tap counts).
   - **Re-pair**: stop one hub, delete `pair` from its `state.json`, start it; accept the new key when asked.
   - **Escape hatch** if pairing is broken and every signed bundle is rejected: post or forward `agent-hub.zip` in 上朝 yourself, with a caption that routes to the target machine (e.g. containing `mac`). Bundles posted by you are installed without a signature (not while `/panic` is active). `push-update.mjs` keeps a copy in the hub folder for this.
 - **Secrets.** Bot and Claude tokens never enter agent environments. Any Claude tool call that touches the hub folder, its secrets or login files, the Mac keychain item, or dumps the whole environment (`printenv`, `env`, `Get-ChildItem env:` …) is blocked — a speed bump, not a sandbox (Codex has no such hook). Everything sent to Telegram and every log line is redacted: `.env` values whose name contains TOKEN / KEY / SECRET / PASS and common token formats (sk-…, ghp_…, bot tokens, private keys) become `[secret]`.
