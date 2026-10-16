@@ -815,16 +815,54 @@ async function refreshCard(k) {
 const cardTimers = new Map();
 const refreshCardSoon = (k, ms = 3000) => { clearTimeout(cardTimers.get(k)); cardTimers.set(k, setTimeout(() => refreshCard(k).catch(e => log('card failed', e)), ms)); };
 // Topic name = status mark + t.title (t.title stays bare: topics are looked up by title). 🟡 working (here, in the desktop
-// app or a terminal), 🔴 waiting for you (a permission / option card), 🟢 idle. config topicStatus: false turns it off.
-export const STATUS_MARKS = { run: '🟡 ', ask: '🔴 ', done: '🟢 ' };
+// app or a terminal), 🔴 waiting for you (a permission / option card), 🔵 the turn ended but background tasks still run
+// (the session wakes up when they finish), 🟢 idle. config topicStatus: false turns it off.
+export const STATUS_MARKS = { run: '🟡 ', ask: '🔴 ', bg: '🔵 ', done: '🟢 ' };
 export const stripMark = name => { const n = String(name), m = Object.values(STATUS_MARKS).find(x => n.startsWith(x)); return m ? n.slice(m.length) : n; };
 const statusTimers = new Map();
-// Sessions `claude agents` shows mid-turn (desktop app, terminals, background agents); refreshed every 30 s.
-let deskBusy = new Set();
+// Sessions `claude agents` shows mid-turn (desktop app, terminals, background agents); refreshed every 30 s. deskBg:
+// sessions with a live process whose transcript has background tasks started and not finished yet.
+let deskBusy = new Set(), deskBg = new Set();
+// Background tasks in transcript lines: started = a tool result "running in background with ID: x", finished = a task
+// notification for x with any status but "running". Returns the still-open ids (added to / removed from `open`).
+export function bgScan(text, open = new Set()) {
+  for (const l of text.split('\n')) {
+    // The notification shows up in whatever form it arrived in (a user turn, or queued mid-turn: queue-operation /
+    // attachment lines): the raw line is enough, the tags survive JSON escaping.
+    if (l.includes('task-id')) for (const x of l.matchAll(/<task-id>([\w-]+)<\/task-id>[\s\S]*?<status>(\w+)<\/status>/g)) if (x[2] !== 'running') open.delete(x[1]);
+    if (!l.includes('ackground with ID')) continue;
+    let m; try { m = JSON.parse(l); } catch { continue; }
+    if (m?.type !== 'user' || m.isSidechain || !Array.isArray(m.message?.content)) continue;
+    for (const b of m.message.content) if (b.type === 'tool_result') { // the result itself, not a quote of it (output that prints another log)
+      const t = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.find(x => x.type === 'text')?.text ?? '' : '';
+      const x = /^Command running in background with ID: ([\w-]+)/.exec(t); if (x) open.add(x[1]);
+    }
+  }
+  return open;
+}
+// Reads what a topic's transcript grew by since the last tick (the last 4 MB the first time) into t.bgOpen.
+const BG_SCAN_V = 2; // bump when bgScan changes: every topic rescans
+function bgTrack(t) {
+  try {
+    const f = transcriptPath(t), size = fs.statSync(f).size;
+    if (t.bgSid !== t.sessionId || t.bgAt == null || size < t.bgAt || t.bgV !== BG_SCAN_V) Object.assign(t, { bgSid: t.sessionId, bgAt: Math.max(0, size - 4 * 1048576), bgOpen: [], bgV: BG_SCAN_V });
+    if (size === t.bgAt) return;
+    const buf = Buffer.alloc(size - t.bgAt), fd = fs.openSync(f, 'r');
+    try { fs.readSync(fd, buf, 0, buf.length, t.bgAt); } finally { fs.closeSync(fd); }
+    const end = buf.lastIndexOf(10) + 1; // a partial last line waits for the next tick
+    t.bgOpen = [...bgScan(buf.toString('utf8', 0, end), new Set(t.bgOpen))].slice(-50); t.bgAt += end;
+  } catch {}
+}
 async function deskStatus() {
   if (CFG.topicStatus === false || state.paused) return;
   const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
   deskBusy = new Set(rows.filter(r => r.status === 'busy' || r.state === 'working').map(r => r.sessionId));
+  const running = new Set(rows.map(r => r.sessionId)); // a closed process took its background tasks with it
+  deskBg = new Set();
+  for (const t of Object.values(state.topics)) if (t.sessionId && !t.isDispatcher && !t.deleted && !t.closed && !isCodex(t) && running.has(t.sessionId)) {
+    bgTrack(t); if (t.bgOpen?.length) deskBg.add(t.sessionId);
+  }
+  save();
   for (const k of Object.keys(state.topics)) statusSoon(k, 0);
 }
 function statusSoon(k, ms = 1500) {
@@ -833,7 +871,7 @@ function statusSoon(k, ms = 1500) {
   statusTimers.set(k, setTimeout(async () => {
     const t = state.topics[k], s = live.get(k);
     if (!t || t.isDispatcher || t.deleted || t.closed || !t.threadId) return;
-    const st = s?.waiting || t.deskAsk ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : 'done';
+    const st = s?.waiting || t.deskAsk ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : s?.bg || deskBg.has(t.sessionId) ? 'bg' : 'done';
     t.status = st;
     const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
     if (name === (t.shownName ?? t.title)) return;
@@ -911,7 +949,7 @@ function startSession(k) {
           if (m.model && t.modelActual !== m.model) { t.modelActual = m.model; save(); }
           refreshCardSoon(k);
         }
-        if (m.type === 'system' && m.subtype === 'background_tasks_changed') { s.bg = (m.tasks || []).filter(x => !x.ambient).length; refreshCardSoon(k); } // ambient = watchers, not activity
+        if (m.type === 'system' && m.subtype === 'background_tasks_changed') { s.bg = (m.tasks || []).filter(x => !x.ambient).length; refreshCardSoon(k); statusSoon(k); } // ambient = watchers, not activity
         if (m.type === 'rate_limit_event' && m.rate_limit_info?.status === 'rejected') s.limited = m.rate_limit_info; // handled when the turn ends
         if (m.type === 'assistant' || m.type === 'user') noteOutputs(t, m, s.pendEdits);
         if (m.type === 'assistant') for (const b of m.message.content) if (b.type === 'tool_use') { s.steps = (s.steps || 0) + 1; s.lastTool = toolSummary(b); progressSoon(k); }

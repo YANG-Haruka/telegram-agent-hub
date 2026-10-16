@@ -477,3 +477,21 @@ test('a desktop option card becomes buttons; taps become the answers', async () 
   assert.equal(await askQuestions(input, 'p', () => Promise.resolve(null)), null); // timed out
   assert.equal(await askQuestions({}, 'p', () => Promise.resolve('0')), null);
 });
+
+import { bgScan } from './hub.mjs';
+test('background tasks a session left running: started by a tool result, finished by its notification', () => {
+  const L = o => JSON.stringify(o);
+  const started = id => L({ type: 'user', message: { content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}. Output is being written to: x` }] } });
+  const note = (id, st) => L({ type: 'user', message: { content: `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>t</tool-use-id>\n<status>${st}</status>\n</task-notification>` } });
+  assert.deepEqual([...bgScan([started('a1'), started('b2'), note('a1', 'completed')].join('\n'))], ['b2']);
+  assert.deepEqual([...bgScan([note('b2', 'running')].join('\n'), new Set(['b2']))], ['b2']); // a progress event, not the end
+  assert.deepEqual([...bgScan([note('b2', 'stopped'), '{"type":"queue-operation","content":"<task-id>zz</task-id>"}', 'partial {'].join('\n'), new Set(['b2']))], []);
+  const queued = L({ type: 'queue-operation', content: '<task-notification>\n<task-id>q7</task-id>\n<status>completed</status>' }); // finished mid-turn
+  assert.deepEqual([...bgScan(queued, new Set(['q7', 'x']))], ['x']);
+  assert.deepEqual([...bgScan(L({ type: 'user', isSidechain: true, message: { content: [{ type: 'tool_result', content: 'running in background with ID: s9' }] } }))], []);
+});
+test('a tool output quoting another session\'s background line is not a background task', () => {
+  const quote = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: '09:13 user [{"content":"Command running in background with ID: zz9. Output"}]' }] } });
+  const real = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: [{ type: 'text', text: 'Command running in background with ID: ok1. Output is being written to: f' }] }] } });
+  assert.deepEqual([...bgScan([quote, real].join('\n'))], ['ok1']);
+});
