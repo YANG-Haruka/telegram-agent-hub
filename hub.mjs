@@ -879,11 +879,12 @@ function startSession(k) {
     },
   });
   live.set(k, s);
+  s.recapCheck = !t.isDispatcher && !!t.sessionId; // resumed: the first turn gets what Telegram said that this branch lacks
   s.effort = effortOf(t); // what the session runs with; startTurn applies a /effort change before the next turn
   // Owner message into the running turn: 'next' = the CLI lets the current tool call finish and the model reads it in the same
   // turn (one result). Never 'now': that aborts the tool and splits the turn in two. After the turn's own message (s.pushed).
   // steerIds: sent but not yet listed in a result's user_message_uuids (added before the wait, so a /stop meanwhile sees it).
-  s.steer = async content => { const uuid = crypto.randomUUID(); s.steerIds.add(uuid); await s.pushed; ch.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '', priority: 'next', uuid }); return true; };
+  s.steer = async content => { const uuid = crypto.randomUUID(); s.steerIds.add(uuid); s.promptAt = Date.now(); await s.pushed; ch.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '', priority: 'next', uuid }); return true; };
   log('session', k, modelOf(t) || 'default', s.effort || 'model default');
   (async () => {
     try {
@@ -906,6 +907,7 @@ function startSession(k) {
         if (m.type === 'rate_limit_event' && m.rate_limit_info?.status === 'rejected') s.limited = m.rate_limit_info; // handled when the turn ends
         if (m.type === 'assistant' || m.type === 'user') noteOutputs(t, m, s.pendEdits);
         if (m.type === 'assistant') for (const b of m.message.content) if (b.type === 'tool_use') { s.steps = (s.steps || 0) + 1; s.lastTool = toolSummary(b); progressSoon(k); }
+        if (m.type === 'assistant' && !m.parent_tool_use_id && m.uuid) s.lastUuid = m.uuid;
         if (m.type === 'assistant' && !m.parent_tool_use_id) for (const b of m.message.content) {
           if (b.type === 'text') s.buf += (s.buf ? '\n\n' : '') + b.text;
           if (b.type === 'image' && b.source?.type === 'base64') bot.api.sendPhoto(t.chatId, new InputFile(Buffer.from(b.source.data, 'base64'), 'image.png'), { message_thread_id: t.threadId }).catch(() => {});
@@ -983,6 +985,8 @@ function startTurn(k, content, adopted = false) {
   const typing = () => bot.api.sendChatAction(t.chatId, 'typing', { message_thread_id: t.threadId }).catch(() => {});
   typing(); s.typing = setInterval(typing, 4500);
   if (adopted) { s.before = snapTree(s, t); s.pushed = Promise.resolve(); return; }
+  s.promptAt = Date.now(); s.turnText = Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text).join('\n') : '';
+  if (s.recapCheck && Array.isArray(content)) { s.recapCheck = false; const r = tgRecap(t); if (r) content.unshift({ type: 'text', text: r }); }
   const msg = { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '' };
   // /effort changed since the last turn (Claude only; Codex sends it with every turn): apply first, then send. null = model default.
   // The git snapshot too: the agent must not touch files before the "before" tree is taken.
@@ -1003,6 +1007,8 @@ async function endTurn(k, err) {
   const turn = { reportTo: s.reportTo, replyTo: s.replyTo, origin: s.origin, depth: s.depth, assigned: s.assigned, nudged: s.nudged, handedOff: s.handedOff, handedTo: s.handedTo, afterTurn: s.afterTurn, limited: s.limited, lastBuf: s.buf.trim() };
   // Files and the end snapshot too: a message arriving while the answer is sent starts the next turn, which changes files.
   const files = t.isDispatcher || CFG.autoSendFiles === false ? [] : turnFiles(t.cwd, s.turnStart || Date.now(), t.outputs, s.sentFiles), before = s.before, after = snapTree(s, t);
+  if (!t.isDispatcher && !isCodex(t) && s.lastUuid && t.sessionId) // what Telegram said, for the desktop (and a later branch here)
+    t.tgLog = [...(t.tgLog || []).filter(e => e.sid === t.sessionId), { sid: t.sessionId, at: Date.now(), leaf: s.lastUuid, user: s.turnText.replace(HUB_WRAP, '').slice(0, 1500), reply: s.buf.trim().slice(0, 3000) }].slice(-10);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
   s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save(); statusSoon(k);
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
@@ -1054,10 +1060,10 @@ function switchAccount(k, acct) {
 // with a copy (t.forkFrom: full memory, first start forks it); the desktop conversation is untouched.
 const onDesktop = async t => !!t.sessionId && !isCodex(t) && (await externalSessions()).some(r => r.sessionId === t.sessionId);
 const DESKTOP_COPY = '📋 这个会话正在桌面 App 或终端里开着，已复制一份带完整记忆的副本在这里继续；桌面那边的对话不受影响。';
-// Owner messages take the session over from the desktop app instead: its CLI process for this session (a child of the
-// Claude app — never a terminal's or the hub's own) is closed once idle there, and the topic goes on with the same session.
-// The window and history stay; the app starts a new process from the transcript (Telegram turns included) on its next
-// message there. Busy there → waits for that turn to end (6 h max). false: nothing taken over (not open in the app).
+// Owner messages go on with the same session even while the desktop app has it open (a CLI process that is a child of the
+// Claude app — never a terminal's or the hub's own): busy there → wait for that turn to end (6 h max), then run here.
+// The app continues from the last message it knows, so the two sides branch; tgRecap / onDesktopPrompt tell each side
+// what the other one said. false: not open in the app.
 export const DESKTOP_APP = /[\\/]WindowsApps[\\/]Claude_[^\\/]*[\\/]app[\\/]claude\.exe$|[\\/]Claude\.app[\\/]/i;
 const parentExe = pid => new Promise(res => process.platform === 'win32'
   ? execFile('powershell', ['-NoProfile', '-Command', `$c = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; (Get-CimInstance Win32_Process -Filter "ProcessId=$($c.ParentProcessId)").ExecutablePath`], { timeout: 15000, windowsHide: true }, (e, out) => res(e ? '' : out.trim()))
@@ -1093,9 +1099,6 @@ function desktopTakeover(k) {
         if (!told) { told = true; await send(t.chatId, t.threadId, '⏳ 桌面上这个会话正在跑，等这一轮做完就接管过来，接着处理你的消息。'); }
         continue;
       }
-      try { process.kill(r.pid); } catch {}
-      for (let i = 0; i < 20 && alive(r.pid); i++) await wait(250);
-      if (alive(r.pid)) return false;
       log('took over from the desktop app', t.sessionId); audit('takeover', t.chatId, t.threadId);
       return true;
     }
@@ -1454,7 +1457,35 @@ async function createTopic(chatId, agent, cwd, sessionId, wanted) {
 // User turns nobody typed (task notifications, slash-command echoes, compaction summaries, the hub's own nudges), and the
 // hub's wrapper lines in front of a task it passed on.
 const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command-message|command-args|local-command-\w+)>|Caveat: |\[Request interrupted|This session is being continued|Hub 刚才重启|刚才额度用完|这是你用 send_to_agent 派出去的任务的结果|你刚才没有把这个任务交给项目话题)/;
-const HUB_WRAP = /^(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)\s*/;
+const HUB_WRAP = /^(（Agent Hub 补充的背景[\s\S]*?（补充背景到此结束）\s*)?(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)?\s*/;
+// The other side's turns, as background (not a request): Telegram ones for the desktop, or for a hub branch that lacks them.
+export const recapText = (ex, intro) => `（Agent Hub 补充的背景，不是新的请求：${intro}，下面这几轮你现在的对话记录里没有，了解一下上下文即可。）\n\n${
+  ex.map(e => `【Telegram ${fmtHM(e.at)}】\n用户：${e.user || '（图片 / 文件）'}\nClaude：${e.reply || '（没有文字回复）'}`).join('\n\n')}\n\n（补充背景到此结束）`;
+// tgLog entries the transcript's newest message doesn't descend from (the hub resumes there; the desktop wrote last).
+export function missingTg(lines, log) {
+  const parent = new Map(); let leaf = null;
+  for (const l of lines) { let m; try { m = JSON.parse(l); } catch { continue; } if (!m?.uuid) continue; parent.set(m.uuid, m.parentUuid); if ((m.type === 'user' || m.type === 'assistant') && !m.isSidechain) leaf = m.uuid; }
+  const anc = new Set(); for (let u = leaf; u && !anc.has(u); u = parent.get(u)) anc.add(u);
+  return log.filter(e => !anc.has(e.leaf));
+}
+function tgRecap(t) {
+  const log = (t.tgLog || []).filter(e => e.sid === t.sessionId);
+  if (!log.length) return '';
+  try { const ex = missingTg(fs.readFileSync(transcriptPath(t), 'utf8').split('\n'), log); return ex.length ? recapText(ex, '这个会话在桌面 App 上也聊过，桌面那边接着写时没有带上用户在手机 Telegram 里和你聊的') : ''; } catch { return ''; }
+}
+// UserPromptSubmit HTTP hook (/approvals on adds it): a desktop / terminal prompt in a topic's session gets the Telegram
+// turns that side hasn't been told about yet. The hub's own prompts (same session id) are skipped by their timing.
+function onDesktopPrompt(req) {
+  const sid = req?.session_id;
+  if (!sid || state.paused) return {};
+  for (const [k, s] of live) if (state.topics[k]?.sessionId === sid && Date.now() - (s.promptAt || 0) < 15e3) return {};
+  const ts = Object.values(state.topics).filter(t => t.sessionId === sid && !t.isDispatcher);
+  const ex = ts.flatMap(t => (t.tgLog || []).filter(e => e.sid === sid && e.at > (t.deskSeen || 0))).sort((a, b) => a.at - b.at);
+  if (!ex.length) return {};
+  for (const t of ts) t.deskSeen = Date.now();
+  save(); log('desktop told about Telegram turns', sid, ex.length);
+  return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: recapText(ex, '你上次在这里回复之后，用户在手机 Telegram 里继续了这个对话') } };
+}
 // The last n exchanges of a transcript (getSessionMessages order): what the user sent, and the assistant's final text before
 // the next user message. Tool calls / results and subagents are left out. auto: a task notification's turn (the session woke
 // up by itself) is an exchange too, with no user side — unless it came mid-turn (the open exchange has no answer yet).
@@ -2739,19 +2770,25 @@ async function cmdApprovals(chatId, threadId, arg) {
   const rest = (j.hooks.PermissionRequest || []).filter(e => e && !(e.hooks || []).some(h => h.url === url)); // also drops nulls: one null makes Claude Code skip the whole file
   j.hooks.PermissionRequest = on ? [...rest, { hooks: [{ type: 'http', url, headers: { Authorization: `Bearer ${ENV.HUB_HOOK_TOKEN}` }, timeout: 300 }] }] : rest;
   if (!j.hooks.PermissionRequest.length) delete j.hooks.PermissionRequest;
+  // Same switch: desktop prompts in a topic's session hear what was said in Telegram meanwhile (onDesktopPrompt).
+  const recapUrl = url.replace(/\/permission$/, '/recap');
+  const restP = (j.hooks.UserPromptSubmit || []).filter(e => e && !(e.hooks || []).some(h => h.url === recapUrl));
+  j.hooks.UserPromptSubmit = on ? [...restP, { hooks: [{ type: 'http', url: recapUrl, headers: { Authorization: `Bearer ${ENV.HUB_HOOK_TOKEN}` }, timeout: 10 }] }] : restP;
+  if (!j.hooks.UserPromptSubmit.length) delete j.hooks.UserPromptSubmit;
   fs.mkdirSync(path.dirname(f), { recursive: true });
   fs.writeFileSync(f, JSON.stringify(j, null, 2));
-  return send(chatId, threadId, on ? `✅ ${CFG.machine}：桌面 App / 终端会话的权限请求会推到「上朝」群（5 分钟没点就回电脑上处理）。新开的会话生效。/approvals off 关闭。` : `✅ ${CFG.machine}：已关闭，桌面会话的权限请求回到电脑上处理。`);
+  return send(chatId, threadId, on ? `✅ ${CFG.machine}：桌面 App / 终端会话的权限请求会推到「上朝」群（5 分钟没点就回电脑上处理）；你在桌面上给话题的会话发消息时，它会先知道你在 Telegram 里聊了什么。新开的会话生效。/approvals off 关闭。` : `✅ ${CFG.machine}：已关闭，桌面会话的权限请求回到电脑上处理。`);
 }
 function startHookServer() {
   if (!ENV.HUB_HOOK_TOKEN) return;
   import('node:http').then(({ createServer }) => createServer((rq, rs) => {
-    if (rq.method !== 'POST' || rq.url !== '/permission' || rq.headers.authorization !== `Bearer ${ENV.HUB_HOOK_TOKEN}`) { rs.writeHead(403).end(); return; }
+    const route = { '/permission': onDesktopPermission, '/recap': onDesktopPrompt }[rq.url];
+    if (rq.method !== 'POST' || !route || rq.headers.authorization !== `Bearer ${ENV.HUB_HOOK_TOKEN}`) { rs.writeHead(403).end(); return; }
     let body = '';
     rq.on('data', d => { body += d; if (body.length > 1e6) rq.destroy(); });
     rq.on('end', async () => {
       let out = {};
-      try { out = await onDesktopPermission(JSON.parse(body)); } catch (e) { log('hook failed', e); }
+      try { out = await route(JSON.parse(body)); } catch (e) { log('hook failed', e); }
       rs.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(out));
     });
   }).on('error', e => { // port taken / reserved (Hyper-V): run without desktop approvals instead of crash-looping

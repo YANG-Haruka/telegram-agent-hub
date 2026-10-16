@@ -450,3 +450,17 @@ test('topic status marks come off a renamed title', () => {
   assert.equal(stripMark('LinguaHaru'), 'LinguaHaru');
   assert.equal(stripMark('🟡 🟢 x'), '🟢 x'); // one mark only: a title may itself start with an emoji
 });
+
+import { missingTg, recapText } from './hub.mjs';
+test('telegram turns a branch lacks; their recap never shows as the user message', () => {
+  const L = (uuid, parentUuid, type = 'assistant', extra = {}) => JSON.stringify({ uuid, parentUuid, type, ...extra });
+  // d1 (desktop) → t1 (Telegram, hub) ; d1 → d2 (desktop again, from its own leaf) — newest is d2's branch
+  const lines = [L('d0', null, 'user'), L('d1', 'd0'), L('tu', 'd1', 'user'), L('t1', 'tu'), L('du', 'd1', 'user'), L('m', 'du', 'system'), L('d2', 'm'), L('s', 'd2', 'assistant', { isSidechain: true }), '{"type":"last-prompt"}', 'partial'];
+  const log = [{ leaf: 't1', at: 0, user: 'q', reply: 'a' }, { leaf: 'd1', at: 0 }];
+  assert.deepEqual(missingTg(lines, log).map(e => e.leaf), ['t1']);
+  assert.deepEqual(missingTg([...lines, L('tu2', 't1', 'user'), L('t2', 'tu2')], log), []); // newest on the Telegram branch: nothing lacks
+  const r = recapText([{ at: Date.now(), user: '改一下', reply: '改好了' }], '用户在 Telegram 里聊了');
+  assert.match(r, /用户：改一下\nClaude：改好了/);
+  assert.deepEqual(exchanges([{ type: 'user', message: { content: [{ type: 'text', text: r }, { type: 'text', text: '这是用户布置的任务，直接开始做：真正的问题' }] } }, { type: 'assistant', message: { content: [{ type: 'text', text: '好' }] } }]),
+    [{ user: '真正的问题', reply: '好' }]);
+});
