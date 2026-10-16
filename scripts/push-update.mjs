@@ -22,7 +22,7 @@ function sealed() {
 }
 const env = { ...sealed(), ...Object.fromEntries(Object.entries(fs.existsSync(path.join(ROOT, '.env')) ? parse('.env') : {}).filter(([, v]) => v)) };
 if (!env.TELEGRAM_BOT_TOKEN) { console.error('TELEGRAM_BOT_TOKEN not found in .env / .env.dpapi (run this from the hub folder)'); process.exit(1); }
-const { exchange, machine: me } = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+const { exchange, machine: me, exchangeThreads } = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
 if (JSON.parse(fs.readFileSync(peerConfig, 'utf8')).machine !== machine) { console.error(`${peerConfig} is not ${machine}'s config`); process.exit(1); }
 
 const FILES = ['hub.mjs', 'package.json', 'package-lock.json', 'config.json'];
@@ -52,6 +52,7 @@ if (pair?.priv && pair.peer?.[machine]) {
 // The other hub reads this message directly (bot-to-bot in the command group) and installs it.
 const fd = new FormData();
 fd.append('chat_id', String(exchange));
+if (exchangeThreads?.machine) fd.append('message_thread_id', String(exchangeThreads.machine)); // 上朝's machine channel
 fd.append('caption', caption);
 fd.append('disable_notification', 'true');
 fd.append('document', new Blob([fs.readFileSync(zip)]), 'agent-hub.zip');

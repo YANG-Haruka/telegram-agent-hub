@@ -495,3 +495,26 @@ test('a tool output quoting another session\'s background line is not a backgrou
   const real = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: [{ type: 'text', text: 'Command running in background with ID: ok1. Output is being written to: f' }] }] } });
   assert.deepEqual([...bgScan([quote, real].join('\n'))], ['ok1']);
 });
+
+import { hubCodeOnly, pendingWebCall } from './hub.mjs';
+test('hub-admin topics may touch the hub code, never its secrets', () => {
+  for (const ok of [String.raw`C:\Users\u\.agent-hub\hub.mjs`, 'cd ~/.agent-hub && node --test hub.test.mjs', '~/.agent-hub/RULES.md'])
+    assert.ok(!touchesSecrets(hubCodeOnly(JSON.stringify({ x: ok }))), ok);
+  for (const bad of [String.raw`C:\Users\u\.agent-hub\.env`,'~/.agent-hub/.env.dpapi', '~/.agent-hub/state.json', 'echo $C1_OAUTH_TOKEN', '~/.claude/.credentials.json'])
+    assert.ok(touchesSecrets(hubCodeOnly(JSON.stringify({ x: bad }))), bad);
+  assert.ok(touchesSecrets(JSON.stringify({ x: '~/.agent-hub/hub.mjs' }))); // other topics: the whole folder stays off limits
+});
+test('a browser call with no result is the desktop app waiting for a site approval', () => {
+  const L = o => JSON.stringify(o);
+  const call = name => L({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input: {} }] } });
+  assert.equal(pendingWebCall([L({ type: 'user', message: { content: 'go' } }), call('mcp__Claude_Browser__javascript_tool'), L({ type: 'attachment' })].join('\n')), 'javascript_tool');
+  assert.equal(pendingWebCall([call('mcp__claude-in-chrome__navigate')].join('\n')), 'navigate');
+  assert.equal(pendingWebCall([call('Bash')].join('\n')), null);
+  assert.equal(pendingWebCall([call('mcp__Claude_Browser__navigate'), L({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } })].join('\n')), null);
+});
+import { lastHost } from './hub.mjs';
+test('the site a stuck browser agent was on: the last navigated URL', () => {
+  const t = [JSON.stringify({ input: { url: 'https://a.example.com/x' } }), JSON.stringify({ input: { url: 'https://shop.example.com/doc?id=1' } }), JSON.stringify({ input: { tabId: 't' } })].join('\n');
+  assert.equal(lastHost(t), 'shop.example.com');
+  assert.equal(lastHost('{"input":{"text":"no url"}}'), '');
+});

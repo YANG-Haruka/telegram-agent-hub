@@ -296,9 +296,13 @@ async function askButtons(chatId, threadId, html, options, vertical = false, ext
 // Owner notices and cards go to 上朝, not the DM (bot DMs annoyed the owner; the callback handler checks the tapper is the
 // owner). The DM only without 上朝 or when posting there fails. Notices are silent unless the caller passes
 // disable_notification: false; cards notify. owner: /stop in 上朝 leaves these cards alone.
+// 上朝's sub-topics (config exchangeThreads, set on both machines): machine = hub-to-hub traffic, todo = the owner's notices
+// and cards; General stays for tasks, dispatcher replies and reports. Unset (or a deleted topic) → General.
+const exThread = which => CFG.exchangeThreads?.[which];
+const inThread = (which, call) => call(exThread(which)).catch(e => exThread(which) && /thread not found|TOPIC_DELETED|TOPIC_CLOSED/i.test(e.description || '') ? call(undefined) : Promise.reject(e));
 const notifyOwner = (text, extra = {}) => { const o = { disable_notification: true, ...extra };
-  return (CFG.exchange ? bot.api.sendMessage(Number(CFG.exchange), text, o) : Promise.reject()).catch(() => bot.api.sendMessage(OWNER, text, o)).catch(() => {}); };
-const askOwnerHere = (html, options, extra = {}) => (CFG.exchange ? askButtons(Number(CFG.exchange), undefined, html, options, !!extra.vertical, { ...extra, owner: true }) : Promise.reject())
+  return (CFG.exchange ? inThread('todo', th => bot.api.sendMessage(Number(CFG.exchange), text, { ...o, message_thread_id: th })) : Promise.reject()).catch(() => bot.api.sendMessage(OWNER, text, o)).catch(() => {}); };
+const askOwnerHere = (html, options, extra = {}) => (CFG.exchange ? askButtons(Number(CFG.exchange), exThread('todo'), html, options, !!extra.vertical, { ...extra, owner: true }) : Promise.reject())
   .catch(() => askButtons(OWNER, undefined, html, options, !!extra.vertical, extra));
 // Confirms an incoming update / move bundle. Safe default; config confirmBundles=false accepts bundles from the trusted peer bot automatically.
 const askOwner = (html, options) => CFG.confirmBundles === false ? (audit('auto-accept', unhtml(html).split('\n')[0].slice(0, 80)), Promise.resolve(options[0][1])) : askOwnerHere(html, options);
@@ -840,6 +844,61 @@ export function bgScan(text, open = new Set()) {
   }
   return open;
 }
+// A browser / computer-use call that got no result for 90 s in the session or its background agents (workflows, subagents):
+// the desktop app is showing its own "allow Claude to act on this site" dialog, which no hook can answer from the phone.
+const WEB_TOOL = /Claude_Browser__|claude-in-chrome__|computer-use__|^computer$/;
+export function pendingWebCall(tail) {
+  const rows = tail.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(m => m?.type === 'user' || m?.type === 'assistant');
+  const m = rows.at(-1), u = m?.type === 'assistant' && Array.isArray(m.message?.content) && m.message.content.find(b => b.type === 'tool_use');
+  return u && WEB_TOOL.test(u.name) ? u.name.replace(/^mcp__[^_]+(_[^_]+)*__/, '') : null;
+}
+// The host of the last URL a transcript's browser calls navigated to (input.url), or ''.
+export function lastHost(text) {
+  let host = '';
+  for (const x of text.matchAll(/"url":"(https?:\/\/[^"]+)"/g)) try { host = new URL(x[1]).host; } catch {}
+  return host;
+}
+function webWait(t) {
+  const main = transcriptPath(t), dir = main.replace(/\.jsonl$/, ''), files = [main], now = Date.now();
+  const walk = d => { try { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name.endsWith('.jsonl')) files.push(p); } } catch {} };
+  walk(dir);
+  for (const f of files) {
+    let st; try { st = fs.statSync(f); } catch { continue; }
+    if (now - st.mtimeMs < 90e3 || now - st.mtimeMs > 6 * 3600e3) continue;
+    const n = Math.min(st.size, 65536), buf = Buffer.alloc(n), fd = fs.openSync(f, 'r');
+    try { fs.readSync(fd, buf, 0, n, st.size - n); } finally { fs.closeSync(fd); }
+    const tool = pendingWebCall(buf.toString('utf8'));
+    if (tool) return { key: `${tool}@${path.basename(f)}@${Math.round(st.mtimeMs)}`, host: lastHost(fs.readFileSync(f, 'utf8')) };
+  }
+  return null;
+}
+// The desktop app's site-approval card, answered from Telegram: buttons in the topic; a tap runs desktop-approve.ps1, which
+// switches the app to the session and clicks the same button there, only if the card's site is the host shown here.
+// Windows only (UI Automation); on the Mac the notice just says to answer it at the computer.
+const webCards = new Map(); // topic key → the open Telegram card
+function webCard(k, host) {
+  const t = state.topics[k];
+  const head = `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想操作网页${host ? `「<b>${esc(host)}</b>」` : ''}，桌面 App 弹了「是否允许 Claude 操作这个网站」，点之前那个任务一直停着。`;
+  if (process.platform !== 'win32') return send(t.chatId, t.threadId, `${head}\n这台电脑上只能去桌面 App 里点。`, { html: true });
+  askButtons(t.chatId, t.threadId, `${head}\n在这里点，Hub 会在电脑上替你点同一个按钮（会把桌面 App 切到这个会话）。`,
+    [['✅ 允许一次', 'once'], ['✅ 总是允许这个网站', 'always'], ['❌ 拒绝', 'deny'], ['💻 我去电脑上点', '']], true, { onId: id => webCards.set(k, id) })
+    .then(v => { webCards.delete(k); if (v) return desktopApprove(k, v, host); })
+    .catch(e => log('web card failed', e.stack || e.message));
+}
+function desktopApprove(k, action, host) {
+  const t = state.topics[k], title = t.deskTitle || t.title;
+  audit('web-approve', t.chatId, t.threadId, action, host || '?'); log('web approve', title, action, host);
+  return new Promise(res => execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HOME, 'desktop-approve.ps1'), '-Title', title, '-Action', action, '-ExpectHost', host || ''],
+    { timeout: 60000, windowsHide: true }, (e, out) => { let r = {}; try { r = JSON.parse(String(out).trim().split('\n').pop()); } catch {} res(e && !r.note ? { note: e.message } : r); }))
+    .then(r => {
+      log('web approve result', JSON.stringify(r));
+      const did = { once: '允许一次', always: '总是允许', deny: '拒绝' }[action];
+      if (r.ok) return send(t.chatId, t.threadId, `✅ 已在电脑上点了「${did}」：${r.url}`);
+      if (r.note === 'host-mismatch') { const real = (() => { try { return new URL(r.url).host; } catch { return ''; } })(); send(t.chatId, t.threadId, `⚠️ 弹窗里的网站其实是 ${r.url}，和上面写的不一样，所以没点。按新的再确认一次：`); return webCard(k, real); }
+      const why = { 'no-card': '弹窗已经不在了（可能已经有人点过）', 'no-session': `桌面 App 里没找到「${title}」这个会话`, 'no-allow-once': '没找到「允许一次」这个选项', covered: '那个按钮被别的窗口挡住了（或电脑锁屏了）' }[r.note] || r.note;
+      return send(t.chatId, t.threadId, `⚠️ 没点成：${why}。请去电脑上处理。`);
+    });
+}
 // Reads what a topic's transcript grew by since the last tick (the last 4 MB the first time) into t.bgOpen.
 const BG_SCAN_V = 2; // bump when bgScan changes: every topic rescans
 function bgTrack(t) {
@@ -861,7 +920,12 @@ async function deskStatus() {
   deskBg = new Set();
   for (const t of Object.values(state.topics)) if (t.sessionId && !t.isDispatcher && !t.deleted && !t.closed && !isCodex(t) && running.has(t.sessionId)) {
     bgTrack(t); if (t.bgOpen?.length) deskBg.add(t.sessionId);
+    const w = webWait(t), k = Object.keys(state.topics).find(x => state.topics[x] === t);
+    if (w && t.webNoted !== w.key) { t.webNoted = w.key; webCard(k, w.host); }
+    t.webWait = w?.key || null;
   }
+  for (const t of Object.values(state.topics)) if (t.webWait && !running.has(t.sessionId)) t.webWait = null;
+  for (const [k, id] of webCards) if (!state.topics[k]?.webWait) { finishWait(id, -1, '💻 已在电脑上处理'); webCards.delete(k); } // answered at the desk
   save();
   for (const k of Object.keys(state.topics)) statusSoon(k, 0);
 }
@@ -871,7 +935,7 @@ function statusSoon(k, ms = 1500) {
   statusTimers.set(k, setTimeout(async () => {
     const t = state.topics[k], s = live.get(k);
     if (!t || t.isDispatcher || t.deleted || t.closed || !t.threadId) return;
-    const st = s?.waiting || t.deskAsk ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : s?.bg || deskBg.has(t.sessionId) ? 'bg' : 'done';
+    const st = s?.waiting || t.deskAsk || t.webWait ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : s?.bg || deskBg.has(t.sessionId) ? 'bg' : 'done';
     t.status = st;
     const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
     if (name === (t.shownName ?? t.title)) return;
@@ -890,9 +954,15 @@ export const touchesSecrets = (s, terms = SECRET_TERMS) => /\.agent-hub\b|agent-
 // Shell commands that print the whole environment (the agent's env carries its account's OAuth token). Commands only:
 // project code reading process.env.X is ordinary work.
 export const dumpsEnv = c => /\bprintenv\b|\b(Get-ChildItem|gci|ls|dir|Get-Item)\s+env:|\[(System\.)?Environment\]::GetEnvironmentVariables|(^|[;&|(]\s*)(set|env|export\s+-p|declare\s+-x)\s*($|[;&|)])|process\.env\b(?!\s*[.[])|\/proc\/\S*environ/im.test(c || '');
-const secretGuard = async input => touchesSecrets(JSON.stringify(input.tool_input || {})) || dumpsEnv(input.tool_input?.command)
-  ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Hub 的目录、密钥、登录文件和环境变量不允许读取或修改。' } }
-  : {};
+// config hubAdminTopics: topic keys where the owner works on the hub itself — its folder is allowed there, but never its
+// secrets (.env*, state.json with the pairing key), login files, token variables or environment dumps.
+export const hubCodeOnly = s => s.replace(/\.agent-hub(?![\\/]+(\.env|state\.json))/gi, '·hub');
+const secretGuard = k => async input => {
+  const s = JSON.stringify(input.tool_input || {}), admin = (CFG.hubAdminTopics || []).includes(k);
+  return touchesSecrets(admin ? hubCodeOnly(s) : s) || dumpsEnv(input.tool_input?.command)
+    ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: admin ? 'Hub 的密钥、登录文件和环境变量不允许读取或修改（Hub 的代码可以）。' : 'Hub 的目录、密钥、登录文件和环境变量不允许读取或修改。' } }
+    : {};
+};
 function startSession(k) {
   const t = state.topics[k];
   if (CFG.agents[t.agent]?.type === 'codex' && !t.isDispatcher) return startCodexSession(k);
@@ -920,7 +990,7 @@ function startSession(k) {
       env: agentEnv(accountOf(t)),
       systemPrompt: { type: 'preset', preset: 'claude_code', append },
       mcpServers: { tg: tgServer(k) },
-      hooks: { PreToolUse: [{ hooks: [secretGuard] }], PostToolUse: [{ hooks: [auditTool(k)] }] }, // run in every permission mode, auto included
+      hooks: { PreToolUse: [{ hooks: [secretGuard(k)] }], PostToolUse: [{ hooks: [auditTool(k)] }] }, // run in every permission mode, auto included
       canUseTool: (name, input, opts) => askPermission(k, name, input, opts),
     },
   });
@@ -1823,11 +1893,11 @@ async function cmdMove(k, arg) {
 // i.e. the same account on this machine; it opens (or re-points) a topic resuming the session.
 async function receiveMove(m, doc) {
   const intoId = String(CFG.moveInto || ownGroups().find(([, g]) => CFG.agents[g.agent]?.type === 'claude')?.[0]), g = CFG.groups[intoId];
-  if (!g) return send(CFG.exchange, undefined, `⚠️ ${CFG.machine} 没有 Claude 群，接收不了搬家包。`);
+  if (!g) return send(CFG.exchange, exThread('todo'), `⚠️ ${CFG.machine} 没有 Claude 群，接收不了搬家包。`);
   const v = await askOwner(`📦 ${esc(m.caption || doc.file_name)}（${Math.round((doc.file_size || 0) / 1024)} KB）\n要在 ${esc(CFG.machine)} 上接收吗？`, [['✅ 接收', 'y'], ['❌ 不要', 'n']]);
   if (v !== 'y') return;
   try { await importMove(m, doc, intoId, g); bot.api.deleteMessage(CFG.exchange, m.message_id).catch(() => {}); } // imported: no plaintext copy left in 上朝 (admins may delete the peer bot's message)
-  catch (e) { log('move import failed', e); await send(CFG.exchange, undefined, `⚠️ ${CFG.machine} 接收搬家包失败：${e.message}`); }
+  catch (e) { log('move import failed', e); await send(CFG.exchange, exThread('todo'), `⚠️ ${CFG.machine} 接收搬家包失败：${e.message}`); }
 }
 async function importMove(m, doc, intoId, g) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-import-'));
@@ -1867,7 +1937,7 @@ async function importMove(m, doc, intoId, g) {
       t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; delete t.forkFrom; markMirror(t); save(); link = topicLink(t.chatId, t.threadId);
       await sendIntro(t, `📦 这个话题已切换到从 ${meta.from} 搬来的会话「${meta.title}」。`, await loadRecap(t, meta.sessionId), '直接发消息接着聊。');
     } else link = (await openProject(Number(intoId), g.agent, target)).link;
-    await send(CFG.exchange, undefined, `📦 已接收从 ${meta.from} 搬来的会话「${meta.title}」${link ? `：${link}` : ''}${codeMissing ? `\n⚠️ 这台电脑上原本没有项目目录，已新建空目录 ${target}。请先把代码同步过来（例如 git clone），否则它只有记忆没有文件。` : ''}`);
+    await send(CFG.exchange, exThread('todo'), `📦 已接收从 ${meta.from} 搬来的会话「${meta.title}」${link ? `：${link}` : ''}${codeMissing ? `\n⚠️ 这台电脑上原本没有项目目录，已新建空目录 ${target}。请先把代码同步过来（例如 git clone），否则它只有记忆没有文件。` : ''}`);
     log('imported move bundle', meta.title, '->', target);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); if (zip) fs.rmSync(zip, { force: true }); }
 }
@@ -2035,8 +2105,8 @@ async function deliverResult(k, body) {
 // i.e. after the outgoing redact middleware.
 async function postToExchange(item) { // { to, text } or { to, file, caption }
   const key = pairKey(item.to), sig = body => key ? `\n${sigLine(key, CFG.machine, item.to, body)}` : '';
-  if (item.file) { const cap = redact(item.caption); await bot.api.sendDocument(CFG.exchange, new InputFile(item.file), { caption: cap + sig(`${cap}|${sha256File(item.file)}`), disable_notification: true }); }
-  else { const text = redact(item.text); await bot.api.sendMessage(CFG.exchange, text + sig(text), { disable_notification: true }); }
+  if (item.file) { const cap = redact(item.caption); await inThread('machine', th => bot.api.sendDocument(CFG.exchange, new InputFile(item.file), { message_thread_id: th, caption: cap + sig(`${cap}|${sha256File(item.file)}`), disable_notification: true })); }
+  else { const text = redact(item.text); await inThread('machine', th => bot.api.sendMessage(CFG.exchange, text + sig(text), { message_thread_id: th, disable_notification: true })); }
 }
 
 // ---------- signed cross-machine control messages ----------
@@ -2076,7 +2146,7 @@ async function announceKey(machine, now) {
   const p = pairState();
   if (!CFG.exchange || (!now && Date.now() - (p.sentAt[machine] || 0) < 3600e3)) return;
   p.sentAt[machine] = Date.now(); save();
-  await bot.api.sendMessage(CFG.exchange, `🔑 → ${machine} ${p.pub}`, { disable_notification: true }).catch(e => log('key announce failed', e.description || e.message));
+  await inThread('machine', th => bot.api.sendMessage(CFG.exchange, `🔑 → ${machine} ${p.pub}`, { message_thread_id: th, disable_notification: true })).catch(e => log('key announce failed', e.description || e.message));
 }
 const announceUnpaired = () => { for (const mc of Object.values(CFG.peers || {})) if (!state.pair?.peer?.[mc]) announceKey(mc); };
 const keyAsks = new Set();
@@ -2101,7 +2171,7 @@ function rejectPeer(why, what) {
   log('rejected peer message:', what, why); audit('peer-rejected', what, JSON.stringify(why));
   if (Date.now() - rejectNoteAt < 600e3) return;
   rejectNoteAt = Date.now();
-  send(CFG.exchange, undefined, `🚫 ${CFG.machine} 拒收了一条 ${peerMachine()} 发来的跨机消息（${why}），没有执行。`);
+  send(CFG.exchange, exThread('todo'), `🚫 ${CFG.machine} 拒收了一条 ${peerMachine()} 发来的跨机消息（${why}），没有执行。`);
 }
 const noteSig = mac => { state.pair.seen = [...state.pair.seen.slice(-499), mac]; save(); };
 // A bundle's signature covers caption + sha256 of the file: checked after download, before anything is unpacked.
@@ -2132,14 +2202,14 @@ async function onPeerMessage(m) {
   // back on the newest version.
   const what = r?.kind === 'result' ? `${r.body.split('\n')[0].slice(0, 80)}` : r ? `@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}` : text.split('\n')[0].slice(0, 80);
   audit('peer', r?.kind || doc?.file_name || '?');
-  if (!isBundle && m.date < Date.now() / 1000 - 600) return send(CFG.exchange, undefined, `⏭ ${CFG.machine} 上线晚了，过期未处理：${what}`);
+  if (!isBundle && m.date < Date.now() / 1000 - 600) return send(CFG.exchange, exThread('machine'), `⏭ ${CFG.machine} 上线晚了，过期未处理：${what}`);
   // After /panic nothing from the other machine runs here (tasks, results, move / update bundles) until /resume_hub.
-  if (state.paused) return send(CFG.exchange, undefined, `⏸ ${CFG.machine} 已紧急停止（/panic），没有处理：${what}`);
+  if (state.paused) return send(CFG.exchange, exThread('machine'), `⏸ ${CFG.machine} 已紧急停止（/panic），没有处理：${what}`);
   if (r?.kind === 'result') return deliverResult(r.key, r.body);
   if (r) {
-    await send(CFG.exchange, undefined, `📥 ${CFG.machine} 收到：@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}`);
+    await send(CFG.exchange, exThread('machine'), `📥 ${CFG.machine} 收到：@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}`);
     const a = Object.hasOwn(CFG.commandAliases || {}, r.alias) && CFG.commandAliases[r.alias];
-    if (!a || !CFG.groups[String(a.group)]) return send(CFG.exchange, undefined, `⚠️ ${CFG.machine} 不认识 @${r.alias}，没有执行。`);
+    if (!a || !CFG.groups[String(a.group)]) return send(CFG.exchange, exThread('machine'), `⚠️ ${CFG.machine} 不认识 @${r.alias}，没有执行。`);
     return assignToGroup(a.group, r.task, r.from || '另一台电脑', r.replyTo, r.origin, r.depth);
   }
   if (/^agent-hub-move-.*\.zip$/i.test(doc.file_name || '')) return receiveMove(m, doc);
@@ -2539,6 +2609,10 @@ async function onMessage(ctx) {
   }
   if (CFG.commandGroups?.[String(chatId)]) { // 上朝: only the machine the message is meant for answers
     const text = m.text || m.caption || '';
+    if (m.message_thread_id && Object.values(CFG.exchangeThreads || {}).includes(m.message_thread_id) && !/^\/(status|panic|resume_hub)\b/.test(text)) {
+      if (CFG.commandDefault === CFG.machine) send(chatId, m.message_thread_id, '这里只放机器消息 / 给你的通知，布置任务请回「下旨」发。');
+      return;
+    }
     const target = routeMachine(text);
     if (target !== CFG.machine) { // the chief dispatcher speaks up when the addressed machine is offline, instead of silence
       if (CFG.commandDefault !== CFG.machine) return;
