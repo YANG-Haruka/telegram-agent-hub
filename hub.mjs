@@ -2106,7 +2106,7 @@ function unsynced(agent) {
   return (sidebarRows()[agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
     && !inside(HOME, r.cwd) && !inside(r.cwd, HOME) && !rootsAbs().some(x => norm(x) === norm(r.cwd)));
 }
-// Sessions created in the desktop app after state.autoSyncFrom (set on the first run: nothing older is pulled in) get a topic
+// Sessions created or used in the desktop app after state.autoSyncFrom (set on the first run: untouched old ones stay out) get a topic
 // in their account's group by themselves, bound to the session itself (not a copy), so the desktop mirror shows its turns.
 // Waits for the app's auto title. config autoSync: false turns it off.
 let autoSyncing = false;
@@ -2127,7 +2127,7 @@ async function autoSync() {
     for (const [chatId, g] of ownGroups()) {
       if (done.has(g.agent) || !CFG.agents[g.agent]?.sidebarDir) continue;
       done.add(g.agent);
-      for (const r of unsynced(g.agent).filter(r => r.createdAt > state.autoSyncFrom && r.title)) {
+      for (const r of unsynced(g.agent).filter(r => Math.max(r.createdAt, r.lastActivityAt) > state.autoSyncFrom && r.title)) {
         const t = await createTopic(Number(chatId), g.agent, r.cwd, r.cliSessionId, r.title);
         t.deskTitle = r.title; t.mirrorAt = openTurnAt(transcriptPath(t)) ?? t.mirrorAt; save(); // still mid-turn on the desktop: that turn is mirrored once it ends
         const ex = await loadRecap(t, r.cliSessionId);
