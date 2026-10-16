@@ -358,6 +358,7 @@ async function askPermission(k, toolName, input, opts) {
   }
   const s = live.get(k);
   if (s) { s.waiting++; progressSoon(k); }
+  statusSoon(k, 0);
   refreshSoon();
   // "Allow for this session" = the CLI's own rule suggestions, kept in memory only; never a mode switch.
   const rules = (suggestions || []).filter(x => x.type === 'addRules' || x.type === 'addDirectories').map(x => ({ ...x, destination: 'session' }));
@@ -366,7 +367,7 @@ async function askPermission(k, toolName, input, opts) {
     [['✅ 允许一次', 'allow'], ...(rules.length ? [['🔁 本会话都允许', 'always']] : []), ['❌ 拒绝', 'deny']], false, { onId: id => { wid = id; } });
   signal?.addEventListener('abort', () => wid && finishWait(wid, -1, '⏹ 已取消'), { once: true });
   let v;
-  try { v = await p; } finally { if (s) s.waiting--; }
+  try { v = await p; } finally { if (s) s.waiting--; statusSoon(k); }
   if (v === 'allow' || v === 'always') tapped.add(opts.toolUseID); // the tap is already in the audit log: auditTool skips it
   if (v === 'always') return { behavior: 'allow', updatedInput: input, updatedPermissions: rules };
   return v === 'allow' ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: '用户在 Telegram 上拒绝了这个操作。', interrupt: v === null };
@@ -813,6 +814,24 @@ async function refreshCard(k) {
 }
 const cardTimers = new Map();
 const refreshCardSoon = (k, ms = 3000) => { clearTimeout(cardTimers.get(k)); cardTimers.set(k, setTimeout(() => refreshCard(k).catch(e => log('card failed', e)), ms)); };
+// Topic name = status mark + t.title (t.title stays bare: topics are looked up by title). 🟡 working, 🔴 waiting for you
+// (a permission card), 🟢 done; no mark before the first turn. config topicStatus: false turns it off.
+export const STATUS_MARKS = { run: '🟡 ', ask: '🔴 ', done: '🟢 ' };
+export const stripMark = name => { const n = String(name), m = Object.values(STATUS_MARKS).find(x => n.startsWith(x)); return m ? n.slice(m.length) : n; };
+const statusTimers = new Map();
+function statusSoon(k, ms = 1500) {
+  if (CFG.topicStatus === false) return;
+  clearTimeout(statusTimers.get(k));
+  statusTimers.set(k, setTimeout(async () => {
+    const t = state.topics[k], s = live.get(k);
+    if (!t || t.isDispatcher || t.deleted || t.closed || !t.threadId) return;
+    const st = s?.waiting ? 'ask' : t.busy ? 'run' : t.status ? 'done' : '';
+    if (st) t.status = st;
+    const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
+    if (name === (t.shownName ?? t.title)) return;
+    await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => { t.shownName = name; save(); }, e => log('topic status failed', e.description || e.message));
+  }, ms));
+}
 
 // Agents run as the same OS user, so they could read the hub's tokens. This blocks the obvious ways (any tool whose
 // input names the hub's .env, a login store or a token variable). ponytail: a speed bump, not a sandbox — the real
@@ -953,7 +972,7 @@ async function updateProgress(k) {
 // adopted: the CLI already runs this turn by itself (an unfolded steered message): bookkeeping only, nothing is sent.
 function startTurn(k, content, adopted = false) {
   const t = state.topics[k], s = live.get(k);
-  s.busy = true; t.busy = true;
+  s.busy = true; t.busy = true; t.status = 'run'; statusSoon(k);
   // origin: 'owner' | 'agent:<topic>' (unset = the owner typed here); depth = agent hops behind this task (see send_to_agent)
   if (content.reportTo || content.replyTo || content.origin) t.turnMeta = { reportTo: content.reportTo, replyTo: content.replyTo, origin: content.origin, depth: content.depth }; else delete t.turnMeta; // survives a restart
   markMirror(t); save();
@@ -985,7 +1004,7 @@ async function endTurn(k, err) {
   // Files and the end snapshot too: a message arriving while the answer is sent starts the next turn, which changes files.
   const files = t.isDispatcher || CFG.autoSendFiles === false ? [] : turnFiles(t.cwd, s.turnStart || Date.now(), t.outputs, s.sentFiles), before = s.before, after = snapTree(s, t);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
-  s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save();
+  s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save(); statusSoon(k);
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
   // resumes the transcript); whatever was queued since goes to the fresh session.
   if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
@@ -1078,7 +1097,6 @@ function desktopTakeover(k) {
       for (let i = 0; i < 20 && alive(r.pid); i++) await wait(250);
       if (alive(r.pid)) return false;
       log('took over from the desktop app', t.sessionId); audit('takeover', t.chatId, t.threadId);
-      await send(t.chatId, t.threadId, '🖥 已从桌面接管这个会话，在这里接着做；回桌面再发消息会自动接上（包括这里聊的）。', { disable_notification: true });
       return true;
     }
     return false;
@@ -2196,8 +2214,7 @@ async function autoSync() {
       if (t.deskTitle == null) { t.deskTitle = d; save(); continue; }
       const taken = new Set(Object.values(state.topics).filter(x => x !== t && x.chatId === t.chatId && !x.deleted).map(x => x.title));
       let name = d.slice(0, 100); for (let n = 2; taken.has(name); n++) name = `${d.slice(0, 95)} #${n}`;
-      const ok = await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => true, e => log('topic rename failed', e.description || e.message));
-      t.deskTitle = d; if (ok) { t.title = name; refreshCardSoon(k, 500); log('topic renamed from desktop', t.sessionId, name); } save();
+      t.deskTitle = d; t.title = name; save(); statusSoon(k, 0); refreshCardSoon(k, 500); log('topic renamed from desktop', t.sessionId, name);
     }
   } finally { autoSyncing = false; }
 }
@@ -2408,6 +2425,12 @@ bot.on('message', ctx => { onMessage(ctx).catch(e => log('message handler failed
 const seenUnknown = new Set();
 async function onMessage(ctx) {
   const m = ctx.message, chatId = ctx.chat.id;
+  if (m.forum_topic_edited) { // our status renames: drop the service line; the owner's rename: the new bare title
+    if (ctx.from?.id === bot.botInfo?.id) return bot.api.deleteMessage(chatId, m.message_id).catch(() => {});
+    const t = state.topics[key(chatId, m.message_thread_id)];
+    if (t && ctx.from?.id === OWNER && m.forum_topic_edited.name) { t.title = stripMark(m.forum_topic_edited.name); t.shownName = m.forum_topic_edited.name; save(); refreshCardSoon(key(chatId, m.message_thread_id), 500); }
+    return;
+  }
   // Only the owner and the hub bots belong in these groups (new members can read the history): remove anyone else, tell the owner.
   const strangers = (m.new_chat_members || []).filter(u => u.id !== OWNER && u.id !== bot.botInfo?.id && !isPeerBot(u));
   if (strangers.length && (ownGroups().some(([id]) => id === String(chatId)) || CFG.commandGroups?.[String(chatId)])) {

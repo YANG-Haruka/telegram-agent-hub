@@ -443,3 +443,10 @@ test("takeover only touches CLI processes the Claude desktop app started", () =>
   for (const p of [String.raw`C:\Program Files\PowerShell\7\pwsh.exe`, String.raw`C:\Users\u\.local\bin\claude.exe`, String.raw`C:\Program Files\nodejs\node.exe`, "/bin/zsh", "/usr/local/bin/node", ""])
     assert.ok(!DESKTOP_APP.test(p), p);
 });
+
+import { STATUS_MARKS, stripMark } from './hub.mjs';
+test('topic status marks come off a renamed title', () => {
+  for (const m of Object.values(STATUS_MARKS)) assert.equal(stripMark(m + 'LinguaHaru'), 'LinguaHaru');
+  assert.equal(stripMark('LinguaHaru'), 'LinguaHaru');
+  assert.equal(stripMark('🟡 🟢 x'), '🟢 x'); // one mark only: a title may itself start with an emoji
+});
