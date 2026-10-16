@@ -36,15 +36,15 @@ test('outputs are recorded only after a successful tool_result', () => {
   assert.deepEqual(t.outputs, ['F:/p/ok.py']);
 });
 
-test('session card mirrors the desktop right panel', () => {
-  const t = { title: 'project-x', cwd: 'D:/work/project-x', outputs: ['D:/work/project-x/a.js', 'F:/other/b.md', ...Array.from({ length: 5 }, (_, i) => `D:/work/project-x/x${i}`)] };
-  const c = renderCard(t, { ctx: 53, bg: 1, mcp: [{ status: 'connected' }, { status: 'needs-auth' }, { status: 'failed' }] }).split('\n');
+test('session card: folder, context, limits, model, effort, mode', () => {
+  const t = { title: 'project-x', cwd: 'D:/work/project-x', outputs: ['D:/work/project-x/a.js'] };
+  const c = renderCard(t, { ctx: 53, bg: 1, limits: ['⏱ 5h   x', '📅 Week y'], mcp: [{ status: 'connected' }] }).split('\n');
   assert.equal(c[0], '📁 project-x · D:/work/project-x');
   assert.match(c[1], /^🧠 Context ▓{5}░{5} 53%$/);
-  assert.equal(c[2], '🔌 Connectors: 1 connected · 2 need reconnect');
-  assert.equal(c[3], '📄 Outputs: a.js, b.md, x0, x1, x2 (+2)');
-  assert.equal(c[4], '⏳ Background tasks: 1 running');
-  assert.match(renderCard({ title: 'n', cwd: 'F:/n' }, {}), /Outputs: none\n⏳ Background tasks: none\n🤖 Model: account default\n🎚 Effort: [^\n]+\n⚙️ Mode: auto-approve, ask only when risky \(auto\)$/);
+  assert.deepEqual(c.slice(2, 4), ['⏱ 5h   x', '📅 Week y']);
+  assert.match(c[4], /^🤖 Model/);
+  assert.ok(!/Connectors|Outputs|Background|Account/.test(c.join('\n'))); // the owner dropped these
+  assert.match(renderCard({ title: 'n', cwd: 'F:/n' }, {}), /🧠 Context: –\n🤖 Model: account default\n🎚 Effort: [^\n]+\n⚙️ Mode: auto-approve, ask only when risky \(auto\)$/);
   assert.match(renderCard({ title: 'n', cwd: 'F:/n', mode: 'default' }, {}), /⚙️ Mode: ask before every action \(ask\)$/);
 });
 
@@ -520,4 +520,15 @@ test('the site a stuck browser agent was on: the last navigated URL', () => {
   const t = [JSON.stringify({ input: { url: 'https://a.example.com/x' } }), JSON.stringify({ input: { url: 'https://shop.example.com/doc?id=1' } }), JSON.stringify({ input: { tabId: 't' } })].join('\n');
   assert.equal(lastHost(t), 'shop.example.com');
   assert.equal(lastHost('{"input":{"text":"no url"}}'), '');
+});
+
+test('desktop mirror carries the files the session sent the owner', () => {
+  const L = o => JSON.stringify(o) + '\n';
+  const buf = Buffer.from([L({ type: 'user', message: { content: '对比一下' } }),
+    L({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 's', name: 'SendUserFile', input: { files: ['a.jpg', 'b.jpg'], caption: '对比图' } }] } }),
+    L({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 's', content: 'sent' }] } }),
+    L({ type: 'assistant', message: { content: [{ type: 'text', text: '发了' }], stop_reason: 'end_turn' } })].join(''));
+  const r = mirrorScan(buf, false);
+  assert.deepEqual(r.ex, [{ user: '对比一下', reply: '发了' }]);
+  assert.deepEqual(r.files, [{ paths: ['a.jpg', 'b.jpg'], caption: '对比图' }]);
 });

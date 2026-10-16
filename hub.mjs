@@ -777,27 +777,29 @@ export const effortOf = t => (t?.isDispatcher ? CFG.dispatcherEffort || 'low' : 
 const codexTier = t => CFG.codexServiceTier === 'default' ? 'default' : t.tierActual; // undefined until the thread has started
 const effortLine = t => `🎚 Effort: ${effortOf(t) || '模型默认'}${t.effort ? '（你设的）' : ''}${isCodex(t) && codexTier(t) !== undefined ? ` · ${/^(priority|fast)$/.test(codexTier(t)) ? 'Fast' : '标准速度'}` : ''}`;
 
+// The pinned session card (the owner's pick): folder, context, the account's 5-hour and weekly limits, model, effort, mode.
+// info.limits: lines from claudeLimits / codexLimits (cached usage; refreshed with the usage panels).
 export function renderCard(t, info) {
-  const rel = f => { const r = path.relative(t.cwd, f); return r && !r.startsWith('..') && !path.isAbsolute(r) ? r : path.basename(f); };
-  const outs = t.outputs || [];
-  const conn = info.mcp || [];
-  const ok = conn.filter(m => m.status === 'connected').length, bad = conn.filter(m => ['failed', 'needs-auth'].includes(m.status)).length;
   return [
     `📁 ${t.title} · ${t.cwd}`,
     info.ctx != null ? `🧠 Context ${bar(info.ctx)} ${Math.round(info.ctx)}%` : '🧠 Context: –',
-    `🔌 Connectors: ${conn.length ? `${ok} connected${bad ? ` · ${bad} need reconnect` : ''}` : '–'}`,
-    `📄 Outputs: ${outs.length ? outs.slice(0, 5).map(rel).join(', ') + (outs.length > 5 ? ` (+${outs.length - 5})` : '') : 'none'}`,
-    `⏳ Background tasks: ${info.bg ? `${info.bg} running` : 'none'}`,
-    accountOf(t) && `👤 Account: ${CFG.agents[accountOf(t)]?.label || accountOf(t)}${t.account && t.account !== t.agent ? ' (switched)' : ''}`,
+    ...(info.limits || []),
     modelLine(isCodex(t) ? null : modelOf(t), t.modelActual), // Codex: the model comes from config.toml, never from /model
     effortLine(t),
     modeLine(modeOf(t)),
   ].filter(Boolean).join('\n');
 }
+// The card's limit lines from what the panels last fetched (never a fetch of its own: the usage endpoint rate-limits).
+function cardLimits(t) {
+  const a = accountOf(t), c = CFG.agents[a];
+  if (!c) return [];
+  const u = c.type === 'codex' ? codexUsageCache?.u : usageCache[a];
+  return u ? (c.type === 'codex' ? codexLimits(u) : claudeLimits(u)).filter(l => !l.startsWith('⚠️')) : [];
+}
 async function refreshCard(k) {
   const t = state.topics[k], s = live.get(k);
   if (!t || t.isDispatcher) return;
-  const info = { bg: s?.bg || 0 };
+  const info = { bg: s?.bg || 0, limits: cardLimits(t) };
   if (s) {
     info.mcp = await s.q.mcpServerStatus().then(l => l.filter(m => m.name !== 'tg'), () => null);
     info.ctx = await s.q.getContextUsage({ detail: 'summary' }).then(c => c?.percentage ?? null, () => null);
@@ -1638,6 +1640,9 @@ export function exchanges(msgs, n = 4, auto = false) {
 // last exchange is finished once the assistant ended the turn (end_turn), or it ends on an answer (text / wrap_up) and the caller
 // says the session has settled; until then `used` stops at its user line (read again next time) and `waiting` says an answer
 // is there, pending that settle. ponytail: a rewound / branched transcript is read as one line of history.
+// Files the desktop session showed the owner with its send-file tool (SendUserFile): [{ paths, caption }].
+const sentFiles = m => m.type !== 'assistant' || !Array.isArray(m.message?.content) ? [] : m.message.content
+  .filter(b => b.type === 'tool_use' && /(^|__)SendUserFile$/.test(b.name) && Array.isArray(b.input?.files)).map(b => ({ paths: b.input.files, caption: b.input.caption || '' }));
 export function mirrorScan(buf, settled) {
   const rows = [], end = buf.lastIndexOf(10) + 1;
   for (let at = 0, nl; (nl = buf.indexOf(10, at)) >= 0; at = nl + 1) {
@@ -1646,7 +1651,7 @@ export function mirrorScan(buf, settled) {
   }
   const blocks = m => { const c = m.message?.content; return typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []; };
   let li = -1; rows.forEach((r, i) => { const b = blocks(r.m); if (r.m.type === 'user' && b.length && !b.some(x => x.type === 'tool_result')) li = i; }); // exchanges()' turn start
-  const done = (ex, used, waiting = false) => ({ ex: exchanges(ex.map(r => r.m), Infinity, true).filter(e => e.reply), used, waiting });
+  const done = (ex, used, waiting = false) => { const files = ex.flatMap(r => sentFiles(r.m)); return { ex: exchanges(ex.map(r => r.m), Infinity, true).filter(e => e.reply), used, waiting, ...(files.length ? { files } : {}) }; };
   if (li < 0 || !exchanges([rows[li].m], 1, true).length) return done(rows, end); // nothing is open (an interruption, a compaction…)
   const tail = rows.slice(li), last = tail.at(-1).m, lb = blocks(last), wrap = b => b.type === 'tool_use' && /wrap_up$/.test(b.name);
   const wraps = new Set(tail.flatMap(r => blocks(r.m).filter(wrap).map(b => b.id)));
@@ -1830,6 +1835,8 @@ async function mirrorDesktop() {
       const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
       const msgs = r.ex.length > 3 ? [`🖥 桌面上新增了 ${r.ex.length} 轮对话，/history 查看`] : r.ex.map(mirrorHtml);
       for (const h of msgs) await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
+      for (const f of r.files || []) for (const [i, p] of f.paths.entries()) // what it sent you there (pictures, reports), same rules as send_file
+        await sendFileTo(t, p, i ? undefined : `🖥 ${f.caption}`.trim()).catch(e => send(t.chatId, t.threadId, `⚠️ 桌面发的文件没能同步：${e.message}`, { disable_notification: true }));
     }
   } finally { mirroring = false; }
 }
@@ -2821,6 +2828,7 @@ async function refreshPanels() {
       const limits = a.type === 'claude' ? claudeLimits(usage) : codexLimits(usage);
       await upsertPanel(chatId, [...limits, '', countsText(sessionCounts(chatId)), modelLine(state.groupModels?.[chatId]), modeLine(state.groupModes?.[chatId] || 'auto')].join('\n'));
       rows.push(...(rows.length ? [''] : []), `[${a.label}]`, ...limits);
+      for (const [k, t] of Object.entries(state.topics)) if (!t.isDispatcher && !t.deleted && accountOf(t) === g.agent) refreshCardSoon(k, 1000); // cards show these limits too
     }
     await upsertPanel(String(OWNER), [...rows, '', countsText(sessionCounts(null)), `🖥 Desktop/terminal sessions: ${(await externalSessions()).length}`].join('\n'));
   } catch (e) { log('panel refresh failed', e); } finally { panelBusy = false; }
