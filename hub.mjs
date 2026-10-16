@@ -2963,7 +2963,8 @@ async function onDesktopPermission(req, gone) {
   // "replying to" that prompt.
   const other = async question => {
     if (over) return null;
-    const p = await send(ch, th, `✏️ 请输入「${question}」的答案（这句不会当成新任务）：`, { reply_markup: { force_reply: true, input_field_placeholder: '输入你的答案…' } });
+    // no force_reply: a prompt left behind (hub restarted while waiting) would pin every client's input box to it
+    const p = await send(ch, th, `✏️ 直接在这里发一句话，当作「${question}」的答案（这句不会当成新任务）。`);
     try { return await waitFreeText(ch, th); } finally { if (p) bot.api.deleteMessage(ch, p.message_id).catch(() => {}); }
   };
   const typed = () => over ? Promise.resolve(null) : waitFreeText(ch, th), onTyped = txt => wid && finishWait(wid, -1, `✏️ 你的回答：${txt.slice(0, 200)}`);
