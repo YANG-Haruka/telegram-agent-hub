@@ -266,16 +266,18 @@ test('agent Markdown renders to Telegram HTML, chunks stay parseable', () => {
   assert.equal(defuseChunk({ html: '<b>ok</b>', plain: 'ok' }).html, '<b>ok</b>');
 });
 import { turnFiles, unsendable } from './hub.mjs';
-test('turn files: new sendable files under the project plus outputs elsewhere', () => {
+test('turn files: only what the agent wrote itself this turn (not what its commands left)', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-test-turn-')), hub = path.join(root, 'hub'), cwd = path.join(root, 'proj'), else_ = path.join(root, 'else');
   const put = (f, ago = 0) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, 'x'); if (ago) fs.utimesSync(f, new Date(Date.now() - ago), new Date(Date.now() - ago)); return fs.realpathSync(f); };
   try {
     const since = Date.now() - 60e3;
-    const want = [put(path.join(cwd, 'a.png')), put(path.join(cwd, 'sub', 'deep', 'x', 'y', 'ok.pdf')), put(path.join(else_, 'report.md'))];
+    const want = [put(path.join(cwd, 'a.png')), put(path.join(else_, 'report.md'))];
+    put(path.join(cwd, 'tests', '_work', 'result', 'out.txt')); // a test run's output: not written by the agent itself
     put(path.join(cwd, 'old.png'), 3600e3); put(path.join(cwd, 'code.js')); put(path.join(cwd, 'sub', 'deep', 'x', 'y', 'z', 'too-deep.png'));
     put(path.join(cwd, 'node_modules', 'n.png')); put(path.join(cwd, '.cache', 'c.png')); put(path.join(cwd, 'my-secret.txt'));
     const sent = put(path.join(cwd, 'sent.png')), inHub = put(path.join(hub, 'x.md'));
-    const got = turnFiles(cwd, since, [path.join(else_, 'report.md'), inHub, path.join(else_, 'missing.md')], new Set([sent]), hub);
+    const old = put(path.join(cwd, 'old.md'), 3600e3);
+    const got = turnFiles(cwd, since, [path.join(cwd, 'a.png'), 'code.js', old, sent, path.join(else_, 'report.md'), inHub, path.join(else_, 'missing.md')], new Set([sent]), hub);
     assert.deepEqual([...got].sort(), [...want].sort());
     assert.match(unsendable(inHub, fs.realpathSync(cwd), hub), /Hub/);
     assert.match(unsendable(path.join(root, '.ssh', 'k.txt'), cwd, hub), /密钥/); // outside the project: the whole path is checked

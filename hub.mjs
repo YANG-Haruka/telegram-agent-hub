@@ -524,22 +524,13 @@ async function cmdShot(chatId, threadId, arg) {
 }
 // ---------- files a turn produced → phone (config autoSendFiles: false turns it off) ----------
 const AUTO_EXT = /\.(png|jpe?g|gif|webp|svg|pdf|docx|xlsx|pptx|csv|mp4|mov|webm|mp3|wav|html|zip|txt|md)$/i;
-// Modified since the turn started: under cwd (depth ≤ 4, ≤ 2000 entries walked, CODE_SKIP / hidden / secret-looking names
-// skipped) plus the agent's Write / Edit outputs anywhere; sendable, not already sent (skip = real paths), newest first.
+// The agent's Write / Edit outputs modified since the turn started; sendable, not already sent (skip = real paths), newest first.
 export function turnFiles(cwd, since, outputs = [], skip = new Set(), hub = HOME) {
-  let root, walked = 0; try { root = fs.realpathSync(cwd); } catch { return []; }
+  // Only files the agent itself wrote or edited with its tools (t.outputs) during this turn: whatever its commands left on
+  // disk (test runs, builds, caches, temp folders) is not "a result" — it sends those on purpose with send_file.
+  let root; try { root = fs.realpathSync(cwd); } catch { return []; }
   const found = new Map();
-  const add = f => { try { const real = fs.realpathSync(f), st = fs.statSync(real); if (st.isFile() && st.mtimeMs >= since && AUTO_EXT.test(real) && !skip.has(real) && !unsendable(real, root, hub)) found.set(real, st.mtimeMs); } catch {} };
-  const walk = (d, depth) => {
-    let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const e of es) {
-      if (++walked > 2000) return;
-      if (CODE_SKIP.test(e.name) || SECRET_NAME.test(e.name)) continue;
-      if (e.isDirectory()) { if (depth < 4) walk(path.join(d, e.name), depth + 1); } else if (e.isFile() && AUTO_EXT.test(e.name)) add(path.join(d, e.name));
-    }
-  };
-  walk(root, 0);
-  for (const f of outputs) add(path.resolve(root, f));
+  for (const f of outputs) try { const real = fs.realpathSync(path.resolve(root, f)), st = fs.statSync(real); if (st.isFile() && st.mtimeMs >= since && AUTO_EXT.test(real) && !skip.has(real) && !unsendable(real, root, hub)) found.set(real, st.mtimeMs); } catch {}
   return [...found].sort((a, b) => b[1] - a[1]).map(([f]) => f);
 }
 const relOf = (t, f) => inside(t.cwd, f) ? path.relative(t.cwd, f) : f;
