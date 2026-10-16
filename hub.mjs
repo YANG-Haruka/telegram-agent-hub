@@ -1374,7 +1374,7 @@ function resolveDir(arg) {
 }
 async function createTopic(chatId, agent, cwd, sessionId, wanted) {
   const base = (wanted || path.basename(cwd) || cwd).slice(0, 100);
-  const taken = new Set(Object.values(state.topics).filter(t => t.chatId === chatId).map(t => t.title));
+  const taken = new Set(Object.values(state.topics).filter(t => t.chatId === chatId && !t.deleted).map(t => t.title));
   let title = base; for (let n = 2; taken.has(title); n++) title = `${base} #${n}`;
   const ft = await bot.api.createForumTopic(chatId, title);
   const k = key(chatId, ft.message_thread_id);
@@ -2143,7 +2143,7 @@ async function autoSync() {
       const d = t.sessionId && !t.deleted && !t.closed && !t.isDispatcher && titles.get(t.sessionId);
       if (!d || d === t.deskTitle) continue;
       if (t.deskTitle == null) { t.deskTitle = d; save(); continue; }
-      const taken = new Set(Object.values(state.topics).filter(x => x !== t && x.chatId === t.chatId).map(x => x.title));
+      const taken = new Set(Object.values(state.topics).filter(x => x !== t && x.chatId === t.chatId && !x.deleted).map(x => x.title));
       let name = d.slice(0, 100); for (let n = 2; taken.has(name); n++) name = `${d.slice(0, 95)} #${n}`;
       const ok = await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => true, e => log('topic rename failed', e.description || e.message));
       t.deskTitle = d; if (ok) { t.title = name; refreshCardSoon(k, 500); log('topic renamed from desktop', t.sessionId, name); } save();
