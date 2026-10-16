@@ -356,3 +356,36 @@ test('/screen and /shot arguments; blank captures detected', () => {
   assert.ok(looksBlank(png(1440, 900, Buffer.alloc(1440 * 900 * 3)))); // all black
   assert.ok(!looksBlank(png(1440, 900, crypto.randomBytes(1440 * 900 * 3).subarray(0, 300000)))); // real content barely compresses
 });
+
+import { exchanges, introHtml, historyMd } from './hub.mjs';
+test('recap: typed user turns and the final assistant text per exchange; noise left out', () => {
+  const u = c => ({ type: 'user', parent_tool_use_id: null, message: { content: c } });
+  const a = (...c) => ({ type: 'assistant', parent_tool_use_id: null, message: { content: c } });
+  const msgs = [
+    u('This session is being continued from a previous conversation…'),
+    u('修一下登录'), a({ type: 'text', text: '我先看看。' }, { type: 'tool_use', id: 't1', name: 'Read', input: {} }),
+    u([{ type: 'tool_result', tool_use_id: 't1', content: 'file' }]),
+    { type: 'assistant', parent_tool_use_id: 't1', message: { content: [{ type: 'text', text: 'subagent noise' }] } },
+    a({ type: 'text', text: '修好了。' }),
+    u([{ type: 'text', text: '<task-notification> <task-id>x</task-id>' }]), a({ type: 'text', text: '后台任务完成。' }),
+    u([{ type: 'image', source: {} }]), a({ type: 'thinking', thinking: '…' }),
+    u('看看图'), a({ type: 'tool_use', id: 't2', name: 'mcp__ccd_turn__wrap_up', input: { recap: '图发你了。', ask: '要换吗？' } }),
+    u([{ type: 'text', text: '这是用户布置的任务，直接开始做：\n\n加个测试' }]), a({ type: 'text', text: '加好了' }),
+  ];
+  assert.deepEqual(exchanges(msgs), [
+    { user: '修一下登录', reply: '修好了。' }, // the notification's answer doesn't overwrite it
+    { user: '（图片 / 文件）', reply: '' },
+    { user: '看看图', reply: '图发你了。\n要换吗？' }, // desktop app: the answer is in wrap_up
+    { user: '加个测试', reply: '加好了' },
+  ]);
+  assert.equal(exchanges(msgs, 1).length, 1);
+  const html = introHtml('已接上 <x>', exchanges(msgs), '目录：F:/p');
+  assert.match(html, /^已接上 &lt;x&gt;\n\n<b>📜 之前的对话（最近 4 轮）<\/b>\n<blockquote expandable><b>你：<\/b>修一下登录\n<b>Claude：<\/b>修好了。/);
+  assert.match(html, /（没有文字回复）[\s\S]*<\/blockquote>\n\n目录：F:\/p$/);
+  assert.equal(introHtml('head', []), 'head');
+  const long = Array.from({ length: 4 }, () => ({ user: '&'.repeat(500), reply: '<'.repeat(500) }));
+  const fit = introHtml('h', long);
+  assert.ok(fit.length <= 4000 && /最近 \d 轮/.test(fit) && !/最近 4 轮/.test(fit)); // oldest dropped until it fits
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(introHtml('h', [{ user: `${'a'.repeat(399)}😀`, reply: '' }]))); // cut never splits an emoji
+  assert.match(historyMd('p', [{ user: 'q', reply: '' }]), /^# p：最近 1 轮对话\n\n## 1\n\n\*\*你：\*\*\n\nq\n\n\*\*Claude：\*\*\n\n（没有文字回复）$/);
+});

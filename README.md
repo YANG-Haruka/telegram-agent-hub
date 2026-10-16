@@ -32,6 +32,8 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 - Agent → phone: the `send_file` tool and `/get <path>` work for any file on the machine (folders are zipped); the hub's own folder and secret-looking files (`.env`, keys, `auth.json`, dotfiles …) are refused.
 - Automatic file sync: after each turn, files the turn created or changed (images, PDF, Office, csv, media, html, zip, txt, md) are sent to the topic — up to 3 directly, the rest behind buttons. `autoSendFiles: false` turns it off.
 - Per-turn change summary for git projects (「📝 N files +a −b」, via a temporary index — your staging area is never touched); `/diff` sends the full diff of the last turn, secret files masked.
+- Steering: a message sent while the agent is working goes straight into the running turn (Claude: `priority: 'next'`, read after the current step; Codex: `turn/steer`) — 「💬 已插话」 instead of queuing. `/stop` still interrupts at once; hub-fed work (handoffs, relays) still queues.
+- Memory takeover: if a project's latest session is open in the desktop app, the topic continues from a copy with the full memory (marked ⑂) instead of asking; an existing topic whose session is open on the desktop offers 「📋 复制一份在这里继续」. Topics started from an existing conversation show 「📜 之前的对话」 (the last few exchanges, collapsed); `/history [n]` sends up to 50 as a Markdown file.
 - `/screen [n]` screenshots this machine's desktop; `/shot <url|port> [width]` screenshots a web page with the installed Edge/Chrome in headless mode. Owner only, no AI, no quota; in 上朝 `/screen mac` asks the Mac.
 
 **Projects and sessions**
@@ -57,7 +59,7 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 - Signed cross-machine messages (see *Security*), DPAPI-encrypted secrets on Windows, secret redaction, stranger removal, append-only audit log.
 
 **Operations**
-- Autostart (Task Scheduler + `start-hub.vbs` / launchd), watchdog (reconnects first, restarts only when idle), heartbeats in group descriptions with offline alerts after 30 min, replies that failed to send are retried every minute.
+- Autostart (Task Scheduler + `start-hub.vbs` / launchd), watchdog (reconnects first, restarts only when idle), heartbeats in group descriptions (no proactive offline alerts: a task sent to an offline machine gets 「🏖 … 今天请假了」; `peerAlerts: true` opts in), replies that failed to send are retried every minute.
 - Crash-loop guard: 3 crashes within 2 minutes of starting → the last version that ran 2 stable minutes (`good/hub.mjs`) is put back, the bad one kept as `logs/hub.mjs.crashed`, and you get a DM.
 - Deploy without cutting a turn: create `restart.flag` next to `hub.mjs`; the hub restarts once every topic is idle (asks you after 6 hours).
 - Daily Agent SDK update at `updateHour` when idle — only releases ≥ 3 days old, self-test plus a real turn per account, rolled back on failure.
@@ -122,7 +124,7 @@ UI text is Chinese (pinned panels are English). Contributions for other language
 | `commandDefault` | machine that answers unnamed 上朝 messages (chief dispatcher) |
 | `commandRoute` | `{ Machine: regex }` keywords that route an unnamed message to that machine |
 | `commandAliases` | `{ nickname: { machine, group } }` |
-| `peers`, `watch` | the other machine(s); heartbeat watching |
+| `peers`, `watch` | the other machine(s); heartbeat watching (`peerAlerts: true` = DM when a peer goes offline / comes back) |
 | `peerBots` | the other hub's bot (username or numeric id). Only these bots are trusted in the command group and allowed in your groups — required for anything cross-machine |
 | `selfUpdate` | accept update bundles from the other machine |
 | `confirmBundles` | default: you tap to accept each update / move bundle; `false` = accept automatically from `peerBots` (a changed pairing key always needs your tap) |

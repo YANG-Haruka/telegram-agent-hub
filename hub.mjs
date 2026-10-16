@@ -246,10 +246,10 @@ function keepUnsent(job) {
 const sendChunk = (chatId, threadId, c, extra) => typeof c === 'string' ? bot.api.sendMessage(chatId, c, { message_thread_id: threadId, ...extra })
   : bot.api.sendMessage(chatId, c.html, { message_thread_id: threadId, ...extra, parse_mode: 'HTML' })
     .catch(e => { if (!/can't parse entities/i.test(e?.description || '')) throw e; return bot.api.sendMessage(chatId, c.plain, { message_thread_id: threadId, ...extra }); });
-// md: the text is the agent's Markdown (rendered per chunk).
-async function send(chatId, threadId, text, { md, ...extra } = {}) {
+// md: the text is the agent's Markdown (rendered per chunk); html: the text is one ready Telegram HTML message (≤ 4000).
+async function send(chatId, threadId, text, { md, html, ...extra } = {}) {
   const ex = String(chatId) === String(CFG.exchange);
-  let last; const job = { chatId, threadId, extra, left: (md ? mdChunks(text) : chunks(text)).map(c => ex ? defuseChunk(c) : c) };
+  let last; const job = { chatId, threadId, extra, left: (html ? [{ html: text, plain: unhtml(text) }] : md ? mdChunks(text) : chunks(text)).map(c => ex ? defuseChunk(c) : c) };
   outgoing.add(job);
   try {
     while (job.left.length) {
@@ -655,7 +655,7 @@ const DISPATCH_PROMPT = g => [
   '- 「上朝」派来的任务（消息开头会写明）：同样处理——判断属于哪个项目，已有话题就 handoff；没有就找到目录 open_project 再 handoff；需要新项目就 fresh=true 再 handoff。结果会自动回报到上朝，你最后回一句交给了哪个话题即可。',
   '- 凡是涉及某个项目内容的事（哪怕只是读一个文件、数行数），都交给那个项目的话题去做，你自己不读项目文件，这样每件事都留在对应话题里。',
   `- 不属于已有项目的新任务（调研、杂事、查电脑信息也算）：给任务起一个简短的英文文件夹名（小写、用连字符，例如 search、sole-proprietor-research），open_project(path=这个名字, fresh=true) 在 ${CFG.defaultRoots[0]} 下新建子文件夹和话题，再 handoff 过去。绝不直接用根目录开话题。不要停下来等，也不要说做不了。`,
-  '- open_project 提示「桌面 App 里开着」：问用户是先在桌面关掉，还是复制一份（ifOpen=fork）。',
+  '- 项目最近的会话正在桌面 App 里开着时，open_project 会自动复制一份带完整记忆的副本（桌面那边不受影响），照常把链接给用户，不用问。',
   '- 只有关于这个群 / 话题本身的问题（有哪些项目、进度）才直接回答。回复要短。',
 ].join('\n');
 // 上朝 (command group, shared by both machines' bots): the hub whose machine the message names takes it
@@ -827,7 +827,7 @@ function startSession(k) {
   const t = state.topics[k];
   if (CFG.agents[t.agent]?.type === 'codex' && !t.isDispatcher) return startCodexSession(k);
   const ch = channel();
-  const s = { push: ch.push, busy: false, waiting: 0, queue: [], buf: '', typing: null, pendEdits: new Map(), account: accountOf(t), idleSince: Date.now() };
+  const s = { push: ch.push, busy: false, waiting: 0, queue: [], buf: '', typing: null, pendEdits: new Map(), account: accountOf(t), idleSince: Date.now(), steerIds: new Set() };
   const append = t.isCommand ? `${PHONE_PROMPT}\n\n${COMMAND_PROMPT()}` : t.isDispatcher ? `${PHONE_PROMPT}\n\n${DISPATCH_PROMPT(CFG.groups[String(t.chatId)])}` : PHONE_PROMPT;
   // Dispatchers start a fresh conversation when their rules change: old history ("last time I did it myself") outweighs new rules.
   // Dispatchers keep their transcripts under the hub dir (never openable as a project), so a project topic opened on the
@@ -856,13 +856,22 @@ function startSession(k) {
   });
   live.set(k, s);
   s.effort = effortOf(t); // what the session runs with; startTurn applies a /effort change before the next turn
+  // Owner message into the running turn: 'next' = the CLI lets the current tool call finish and the model reads it in the same
+  // turn (one result). Never 'now': that aborts the tool and splits the turn in two. After the turn's own message (s.pushed).
+  // steerIds: sent but not yet listed in a result's user_message_uuids (added before the wait, so a /stop meanwhile sees it).
+  s.steer = async content => { const uuid = crypto.randomUUID(); s.steerIds.add(uuid); await s.pushed; ch.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '', priority: 'next', uuid }); return true; };
   log('session', k, modelOf(t) || 'default', s.effort || 'model default');
   (async () => {
     try {
       for await (const m of s.q) {
+        // A message steered in while the turn was already answering runs as a turn of its own: track it as one (no report /
+        // result obligations), so its answer, files and diff reach the topic and later messages steer into it, not end it.
+        // cliQueued: the last result said the CLI runs more sends by itself. Subagent frames (background agents) never start one.
+        if (!s.busy && (s.steerIds.size || s.cliQueued) && (m.type === 'assistant' && !m.parent_tool_use_id || m.type === 'result') && live.get(k) === s) startTurn(k, [], true);
         if (m.type === 'system' && m.subtype === 'init') {
           if (t.sessionId !== m.session_id) {
             const fresh = !t.sessionId;
+            if (t.forkFrom) t.copyOf = t.forkFrom; // /sync: the original stays "already has a topic"
             t.sessionId = m.session_id; delete t.forkFrom; save();
             if (fresh) renameSession(m.session_id, `tg:${t.title}`).catch(() => {});
           }
@@ -879,6 +888,8 @@ function startSession(k) {
         }
         if (m.type === 'assistant' && m.error === 'authentication_failed') noteAuth(t, true);
         if (m.type === 'result') {
+          for (const u of m.user_message_uuids || [m.user_message_uuid]) s.steerIds.delete(u); // folded in or answered: done
+          s.cliQueued = m.queued_turn_count || 0;
           noteAuth(t, m.is_error && isAuthError(`${m.result || ''} ${(m.errors || []).join(' ')}`));
           endTurn(k, m.is_error ? `⚠️ ${m.subtype}${m.result ? ': ' + m.result : ''}` : '');
         }
@@ -934,7 +945,8 @@ async function updateProgress(k) {
 
 // content.reportTo (set by deliverHandoff for 上朝 tasks) travels with the queued message, so only that task's turn reports back
 // (content.afterTurn likewise: /handoff's "deliver this answer as the note").
-function startTurn(k, content) {
+// adopted: the CLI already runs this turn by itself (an unfolded steered message): bookkeeping only, nothing is sent.
+function startTurn(k, content, adopted = false) {
   const t = state.topics[k], s = live.get(k);
   s.busy = true; t.busy = true;
   // origin: 'owner' | 'agent:<topic>' (unset = the owner typed here); depth = agent hops behind this task (see send_to_agent)
@@ -946,13 +958,14 @@ function startTurn(k, content) {
   progressSoon(k);
   const typing = () => bot.api.sendChatAction(t.chatId, 'typing', { message_thread_id: t.threadId }).catch(() => {});
   typing(); s.typing = setInterval(typing, 4500);
+  if (adopted) { s.before = snapTree(s, t); s.pushed = Promise.resolve(); return; }
   const msg = { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '' };
   // /effort changed since the last turn (Claude only; Codex sends it with every turn): apply first, then send. null = model default.
   // The git snapshot too: the agent must not touch files before the "before" tree is taken.
   const e = effortOf(t);
   const effortSet = s.q.applyFlagSettings && s.effort !== e ? (s.effort = e, s.q.applyFlagSettings({ effortLevel: e ?? null }).catch(err => log('effort failed', err))) : null;
   s.before = snapTree(s, t);
-  Promise.all([effortSet, s.before]).finally(() => s.push(msg));
+  s.pushed = Promise.all([effortSet, s.before]).finally(() => s.push(msg)); // Codex: settles once turn/start returned (turnId known)
 }
 
 async function endTurn(k, err) {
@@ -968,6 +981,9 @@ async function endTurn(k, err) {
   const files = t.isDispatcher || CFG.autoSendFiles === false ? [] : turnFiles(t.cwd, s.turnStart || Date.now(), t.outputs, s.sentFiles), before = s.before, after = snapTree(s, t);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
   s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; save();
+  // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
+  // resumes the transcript); whatever was queued since goes to the fresh session.
+  if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
   await send(t.chatId, t.threadId, t.isCommand ? `🗣 ${text}` : text, { md: true }); // 上朝: a fixed prefix, so the reply can never read as a relay to the peer hub
   if (!t.isDispatcher) postTurnDiff(k, before, after).catch(e => log('turn diff failed', e.message)).then(() => files.length && sendTurnFiles(k, files)).catch(e => log('auto send failed', e));
   refreshSoon(); refreshCardSoon(k, 500);
@@ -991,9 +1007,11 @@ async function endTurn(k, err) {
   if (turn.replyTo && !cut) returnResult(turn.replyTo, t, text).catch(e => log('returnResult failed', e));
   if (turn.afterTurn) turn.afterTurn(s.lastText = text).catch(e => log('afterTurn failed', e));
   if (cut) { offerLimitChoice(k, turn.limited, s.queue.splice(0), { reportTo: turn.reportTo, replyTo: turn.replyTo, origin: turn.origin, depth: turn.depth }).catch(e => log('limit choice failed', e)); return; }
-  if (s.busy) return; // a new message already started the next turn while we were sending
+  // The CLI runs a steered message next as its own turn (adopted when it starts): hub-fed work waits behind it, or that turn's
+  // answer would be reported / returned as the queued task's result.
+  if (s.busy || live.get(k) !== s || s.cliQueued) return; // a new message already started the next turn while we were sending / closed after /stop
   if (s.queue.length) startTurn(k, s.queue.shift());
-  else if (s.account !== accountOf(t)) closeLive(k); // account switched mid-turn: next message resumes on the new account
+  else if (s.account !== accountOf(t) && live.get(k) === s) closeLive(k); // account switched mid-turn: next message resumes on the new account
 }
 
 // ---------- accounts: same session, different Claude account (transcripts are shared in ~/.claude) ----------
@@ -1008,6 +1026,16 @@ function switchAccount(k, acct) {
   if (s && !s.busy) closeLive(k);
   refreshCardSoon(k, 500);
 }
+// A topic's own session open in the desktop app / a terminal: two writers would branch one transcript, so the topic goes on
+// with a copy (t.forkFrom: full memory, first start forks it); the desktop conversation is untouched.
+const onDesktop = async t => !!t.sessionId && !isCodex(t) && (await externalSessions()).some(r => r.sessionId === t.sessionId);
+const DESKTOP_COPY = '📋 这个会话正在桌面 App 或终端里开着，已复制一份带完整记忆的副本在这里继续；桌面那边的对话不受影响。';
+async function copyTopic(k, head = DESKTOP_COPY) {
+  const t = state.topics[k], from = t.sessionId;
+  if (!from) return; // two callers raced past onDesktop (both await it): the first already copied, keep its forkFrom
+  t.forkFrom = from; t.sessionId = null; save();
+  await sendIntro(t, head, await loadRecap(t, from));
+}
 // Starts a turn on topic k, or queues it behind the running one.
 async function feed(k, content) {
   const t = state.topics[k];
@@ -1015,7 +1043,7 @@ async function feed(k, content) {
   if (state.paused) { log('paused, not started', t?.title); return false; } // /panic: no resumes, results or relays start work
   let s = live.get(k);
   if (!s) {
-    if (t.sessionId && (await externalSessions()).some(r => r.sessionId === t.sessionId)) { await send(t.chatId, t.threadId, '⚠️ 这个会话正在桌面 App 里开着，没能自动继续。关掉桌面后发「继续」即可。'); return false; }
+    if (await onDesktop(t) && !live.get(k)) await copyTopic(k); // an agent can't tap: copy without asking
     s = live.get(k) || startSession(k);
   }
   if (s.busy || s.queue.length) s.queue.push(content); else startTurn(k, content);
@@ -1265,17 +1293,26 @@ function startCodexSession(k) {
     log('codex thread', k, r.model, r.reasoningEffort, r.serviceTier);
     refreshCardSoon(k);
   })().catch(async e => { log('codex start failed', e); await send(t.chatId, t.threadId, `⚠️ Codex 启动失败：${e.message}`); rpc.kill(); });
-  s.push = async msg => {
-    await ready;
-    if (closed) return;
+  const codexInput = content => {
     const input = [];
-    for (const [i, b] of msg.message.content.entries()) { // i: an album's images are written in the same millisecond
+    for (const [i, b] of content.entries()) { // i: an album's images are written in the same millisecond
       if (b.type === 'text') input.push({ type: 'text', text: b.text });
       if (b.type === 'image') { const f = path.join(INBOX, String(t.threadId), `${Date.now()}-${i}.${b.source.media_type.split('/')[1].replace('jpeg', 'jpg')}`); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, Buffer.from(b.source.data, 'base64')); input.push({ type: 'localImage', path: f }); }
     }
-    const r = await rpc.call('turn/start', { threadId, input, approvalPolicy: codexPolicy(modeOf(t)), effort: effortOf(t), // never a model: that stays config.toml's
+    return input;
+  };
+  s.push = async msg => {
+    await ready;
+    if (closed) return;
+    const r = await rpc.call('turn/start', { threadId, input: codexInput(msg.message.content), approvalPolicy: codexPolicy(modeOf(t)), effort: effortOf(t), // never a model: that stays config.toml's
       ...(CFG.codexServiceTier === 'default' ? { serviceTierForTurn: 'default' } : {}) }).catch(async e => { await endTurn(k, `⚠️ ${e.message}`); return null; });
     if (r?.turn?.id) turnId = r.turn.id;
+  };
+  // Owner message into the active turn. Fails (→ false, the caller queues it) once that turn is over: expectedTurnId must match.
+  s.steer = async content => {
+    await s.pushed;
+    if (closed || !turnId) return false;
+    return rpc.call('turn/steer', { threadId, expectedTurnId: turnId, input: codexInput(content) }).then(() => true, e => { log('codex steer failed', e.message); return false; });
   };
   s.q = {
     interrupt: () => turnId ? rpc.call('turn/interrupt', { threadId, turnId }) : Promise.resolve(),
@@ -1341,13 +1378,50 @@ async function createTopic(chatId, agent, cwd, sessionId, wanted) {
   save();
   return state.topics[k];
 }
-function lastAssistantText(msgs) {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const c = msgs[i].type === 'assistant' && !msgs[i].parent_tool_use_id && msgs[i].message?.content;
-    const txt = Array.isArray(c) ? c.filter(b => b.type === 'text').map(b => b.text).join('\n').trim() : '';
-    if (txt) return txt;
+// ---------- recap: show a resumed / copied conversation's memory in Telegram ----------
+// User turns nobody typed (task notifications, slash-command echoes, compaction summaries, the hub's own nudges), and the
+// hub's wrapper lines in front of a task it passed on.
+const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command-message|command-args|local-command-\w+)>|Caveat: |\[Request interrupted|This session is being continued|Hub 刚才重启|刚才额度用完|这是你用 send_to_agent 派出去的任务的结果|你刚才没有把这个任务交给项目话题)/;
+const HUB_WRAP = /^(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)\s*/;
+// The last n exchanges of a transcript (getSessionMessages order): what the user sent, and the assistant's final text before
+// the next user message. Tool calls / results and subagents are left out.
+export function exchanges(msgs, n = 4) {
+  const out = []; let cur = null; // answers to an untyped turn (a task notification…) belong to no exchange
+  for (const m of msgs) {
+    if (m.parent_tool_use_id) continue;
+    const c = m.message?.content, blocks = typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : [];
+    // The desktop app shows a turn's answer from its wrap_up tool (recap + ask), often with no text block at all.
+    const text = blocks.map(b => b.type === 'text' ? b.text : b.type === 'tool_use' && /wrap_up$/.test(b.name) && b.input?.recap ? [b.input.recap, b.input.ask].filter(Boolean).join('\n') : '').filter(Boolean).join('\n').trim();
+    if (m.type === 'user' && blocks.length && !blocks.some(b => b.type === 'tool_result')) out.push(cur = NOT_TYPED.test(text) ? null : { user: text.replace(HUB_WRAP, '') || '（图片 / 文件）', reply: '' });
+    else if (m.type === 'assistant' && text && cur) cur.reply = text;
   }
-  return '';
+  return out.filter(Boolean).slice(-n);
+}
+// One message: head, the exchanges as a collapsed quote (each side cut to 400 chars), tail; oldest dropped until it fits.
+export function introHtml(head, ex, tail = '') {
+  const cut400 = s => s.length > 400 ? `${s.slice(0, 400).replace(/[\uD800-\uDBFF]$/, '')}…` : s; // half an emoji: Telegram rejects the message
+  for (let i = 0; ; i++) {
+    const e = ex.slice(i), quote = e.length && `<b>📜 之前的对话（最近 ${e.length} 轮）</b>\n<blockquote expandable>${e.map(x => `<b>你：</b>${esc(cut400(x.user))}\n<b>Claude：</b>${esc(cut400(x.reply) || '（没有文字回复）')}`).join('\n\n')}</blockquote>`;
+    const html = [esc(head), quote, tail && esc(tail)].filter(Boolean).join('\n\n');
+    if (html.length <= 4000 || !e.length) return html;
+  }
+}
+export const historyMd = (title, ex) => [`# ${title}：最近 ${ex.length} 轮对话`, ...ex.map((e, i) => `## ${i + 1}\n\n**你：**\n\n${e.user}\n\n**Claude：**\n\n${e.reply || '（没有文字回复）'}`)].join('\n\n');
+// Also records the files that conversation produced (card outputs). Codex threads: none (not in ~/.claude).
+async function loadRecap(t, from) {
+  if (!from || isCodex(t)) return [];
+  try { const msgs = await getSessionMessages(from), pend = new Map(); for (const m of msgs) noteOutputs(t, m, pend); save(); return exchanges(msgs); } catch { return []; }
+}
+const sendIntro = (t, head, ex, tail) => send(t.chatId, t.threadId, introHtml(head, ex, tail), { html: true });
+// /history [n] — the last n exchanges (default 10, max 50) as history-<title>.md, inline too when short.
+async function cmdHistory(k, arg) {
+  const t = state.topics[k], n = Math.min(Math.max(parseInt(arg, 10) || 10, 1), 50), from = t.sessionId || t.forkFrom;
+  if (isCodex(t)) return send(t.chatId, t.threadId, 'Codex 话题暂不支持 /history。');
+  const ex = from ? exchanges(await getSessionMessages(from), n) : [];
+  if (!ex.length) return send(t.chatId, t.threadId, '这个话题还没有对话记录。');
+  const md = redact(historyMd(t.title, ex));
+  await bot.api.sendDocument(t.chatId, new InputFile(Buffer.from(md), `history-${t.title.replace(/[\\/:*?"<>|\s]+/g, '-')}.md`), { message_thread_id: t.threadId, caption: `最近 ${ex.length} 轮对话` });
+  if (md.length <= 3500) await send(t.chatId, t.threadId, md, { md: true });
 }
 
 async function cmdOpen(ctx, g, arg, fresh) {
@@ -1364,9 +1438,9 @@ async function cmdOpen(ctx, g, arg, fresh) {
 }
 
 // Shared by /open, /new and the General dispatcher agent. Returns { text, link? }.
-// ifOpen: what to do when the folder's latest session is open in the desktop app — 'refuse' or 'fork' (copy with full memory).
-async function openProject(chatId, agent, p, { fresh = false, ifOpen = 'refuse' } = {}) {
-  let sessionId = null, forkFrom = null, sessions = [], codexPreview = '';
+// The folder's latest session already in use (desktop app / terminal, or another group's topic): the topic gets a copy with full memory.
+async function openProject(chatId, agent, p, { fresh = false } = {}) {
+  let sessionId = null, forkFrom = null, sessions = [], codexPreview = '', where = '';
   const isCodex = CFG.agents[agent]?.type === 'codex';
   if (isCodex) { if (!fresh) { const th = await codexLatestThread(p); if (th) { sessions = [{ sessionId: th.id }]; codexPreview = th.name || th.preview || ''; } } }
   else try { sessions = (await listSessions({ dir: p })).sort((a, b) => b.lastModified - a.lastModified); } catch {}
@@ -1379,31 +1453,20 @@ async function openProject(chatId, agent, p, { fresh = false, ifOpen = 'refuse' 
     if (existing) return { text: `这个项目已经有话题了：${existing.title}\n${topicLink(chatId, existing.threadId)}`, link: topicLink(chatId, existing.threadId), key: key(chatId, existing.threadId) };
     sessionId = sessions[0]?.sessionId || null;
     // Already driven by a hub topic in another group (another account): two processes on one transcript would branch it.
-    if (sessionId && !isCodex && Object.values(state.topics).some(x => x.sessionId === sessionId && !x.deleted)) { forkFrom = sessionId; sessionId = null; }
-    else if (sessionId && !isCodex && (await externalSessions()).some(r => r.sessionId === sessionId)) {
-      if (ifOpen !== 'fork') return { text: `「${path.basename(p)}」最近的会话正在桌面 App 或终端里开着。可以先在电脑上关掉它再打开，或者复制一份（带完整记忆）在这里继续。` };
-      forkFrom = sessionId; sessionId = null;
-    }
+    if (sessionId && !isCodex && Object.values(state.topics).some(x => x.sessionId === sessionId && !x.deleted)) { forkFrom = sessionId; sessionId = null; where = '另一个群的话题'; }
+    else if (sessionId && !isCodex && (await externalSessions()).some(r => r.sessionId === sessionId)) { forkFrom = sessionId; sessionId = null; where = '桌面 App 或终端'; }
   }
   // No trust prompt: the owner chose whole-machine access (design doc §0.4); SDK sessions run repo hooks/.mcp.json without asking.
   const t = await createTopic(chatId, agent, p, sessionId, forkFrom ? `${path.basename(p)} ⑂` : undefined);
   if (forkFrom) { t.forkFrom = forkFrom; save(); }
-  const from = sessionId || forkFrom;
   let intro = sessionId ? `已接上「${t.title}」上次的对话（${CFG.agents[agent].label}）。`
-    : forkFrom ? `最近的会话正在别处用着（桌面 App 或另一个群的话题），已复制一份带完整记忆的副本在这里继续（${CFG.agents[agent].label}）。` : `新会话「${t.title}」（${CFG.agents[agent].label}）。`;
+    : forkFrom ? `「${path.basename(p)}」最近的会话正在${where}里用着，已复制一份带完整记忆的副本在这里继续（${CFG.agents[agent].label}）；${where === '桌面 App 或终端' ? '桌面' : '原话题'}那边的对话不受影响。` : `新会话「${t.title}」（${CFG.agents[agent].label}）。`;
   if (isCodex && codexPreview) intro += `\n\n上次的线程：${codexPreview.slice(0, 300)}`;
-  if (from && !isCodex) {
-    try {
-      const msgs = await getSessionMessages(from);
-      const pend = new Map(); for (const m of msgs) noteOutputs(t, m, pend);
-      save();
-      const last = lastAssistantText(msgs); if (last) intro += `\n\n上次最后的回复：\n${last.slice(0, 600)}${last.length > 600 ? '…' : ''}`;
-    } catch {}
-  }
+  const ex = await loadRecap(t, sessionId || forkFrom);
   await refreshCard(key(chatId, t.threadId)).catch(e => log('card failed', e));
-  await send(chatId, t.threadId, `${intro}\n\n目录：${p}\n直接在这里发消息即可。`);
+  await sendIntro(t, intro, ex, `目录：${p}\n直接在这里发消息即可。`);
   const link = topicLink(chatId, t.threadId);
-  return { text: `已开话题：${t.title}\n${link}`, link, key: key(chatId, t.threadId), title: t.title, resumed: !!sessionId, forked: !!forkFrom };
+  return { text: `已开话题：${t.title}${forkFrom ? `（${where}里正用着原会话，这是带完整记忆的副本，原会话不受影响）` : ''}\n${link}`, link, key: key(chatId, t.threadId), title: t.title, resumed: !!sessionId, forked: !!forkFrom };
 }
 
 async function cmdStatus(ctx) {
@@ -1429,6 +1492,8 @@ async function cmdStop(k) {
   const t = state.topics[k], s = live.get(k);
   if (!s) return send(t.chatId, t.threadId, '当前没有在运行。');
   s.queue = [];
+  // Steered messages the CLI hasn't run yet must not run after /stop: close once the stopped turn ends (see endTurn), or now if idle.
+  if (s.steerIds?.size || s.cliQueued) { if (s.busy) s.closeAfter = true; else closeLive(k); }
   for (const [id, w] of waits) if (w.chatId === t.chatId && w.threadId === t.threadId) finishWait(id, -1, '⏹ 已停止');
   await s.q.interrupt().catch(() => {});
   await send(t.chatId, t.threadId, '⏹ 已停止当前这一轮，排队的消息已清空。');
@@ -1576,8 +1641,8 @@ async function importMove(m, doc, intoId, g) {
     if (backup) log('move: kept diverged transcript as', backup);
     if (existing) {
       const [kk, t] = existing; closeLive(kk);
-      t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; save(); link = topicLink(t.chatId, t.threadId);
-      await send(t.chatId, t.threadId, `📦 这个话题已切换到从 ${meta.from} 搬来的会话「${meta.title}」，直接发消息接着聊。`);
+      t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; delete t.forkFrom; save(); link = topicLink(t.chatId, t.threadId);
+      await sendIntro(t, `📦 这个话题已切换到从 ${meta.from} 搬来的会话「${meta.title}」。`, await loadRecap(t, meta.sessionId), '直接发消息接着聊。');
     } else link = (await openProject(Number(intoId), g.agent, target)).link;
     await send(CFG.exchange, undefined, `📦 已接收从 ${meta.from} 搬来的会话「${meta.title}」${link ? `：${link}` : ''}${codeMissing ? `\n⚠️ 这台电脑上原本没有项目目录，已新建空目录 ${target}。请先把代码同步过来（例如 git clone），否则它只有记忆没有文件。` : ''}`);
     log('imported move bundle', meta.title, '->', target);
@@ -1596,8 +1661,9 @@ async function cmdFork(k) {
   const g = CFG.groups[target];
   const nt = await createTopic(Number(target), g.agent, t.cwd, null, `${t.title} ⑂`);
   nt.forkFrom = t.sessionId; nt.outputs = [...(t.outputs || [])]; save();
+  const ex = await loadRecap(nt, t.sessionId);
   await refreshCard(key(nt.chatId, nt.threadId)).catch(e => log('card failed', e));
-  await send(nt.chatId, nt.threadId, `⑂ 从「${t.title}」（${CFG.agents[t.agent].label}）复制而来，带着完整的对话记忆，现在用 ${CFG.agents[g.agent].label} 继续。\n直接发消息即可；原话题不受影响。`);
+  await sendIntro(nt, `⑂ 从「${t.title}」（${CFG.agents[t.agent].label}）复制而来，带着完整的对话记忆，现在用 ${CFG.agents[g.agent].label} 继续。`, ex, '直接发消息即可；原话题不受影响。');
   return send(t.chatId, t.threadId, `⑂ 已复制到 ${g.title}：${topicLink(nt.chatId, nt.threadId)}`);
 }
 
@@ -1614,7 +1680,7 @@ async function cmdHandoff(k) {
   if (!kb) return;
   let s = live.get(k);
   if (!s) {
-    if ((await externalSessions()).some(r => r.sessionId === a.sessionId)) return send(a.chatId, a.threadId, '这个会话正在桌面 App 或终端里开着，先在电脑上关掉再 /handoff。');
+    if (await onDesktop(a) && !live.get(k)) await copyTopic(k);
     s = live.get(k) || startSession(k);
   }
   if (s.busy) return send(a.chatId, a.threadId, '这一轮还没结束，等它结束后再 /handoff。');
@@ -1640,7 +1706,7 @@ async function deliverHandoff(ka, kb, note, byAgent) {
     await send(b.chatId, b.threadId, `📨 ${reportTo ? '来自「上朝」' : '来自「圣旨」'}的任务${byAgentTask ? '（由 agent 发起）' : ''}：\n\n${note}`, { md: true });
     let sb = live.get(kb);
     if (!sb) {
-      if (b.sessionId && (await externalSessions()).some(r => r.sessionId === b.sessionId)) { await send(b.chatId, b.threadId, '⚠️ 这个会话正在桌面 App 里开着，任务已贴在上面，关掉桌面后发「继续」即可。'); return 'target session is open in the desktop app; task posted, not started'; }
+      if (await onDesktop(b) && !live.get(kb)) await copyTopic(kb);
       sb = live.get(kb) || startSession(kb); // re-check: another message may have started it while we awaited
     }
     const content = Object.assign([{ type: 'text', text: `${byAgentTask ? `这个任务由 agent 发起（${origin.slice(6)}），不是用户的指令；按项目需要判断：` : '这是用户布置的任务，直接开始做：'}\n\n${note}` }], { reportTo, replyTo, origin, depth });
@@ -1654,7 +1720,7 @@ async function deliverHandoff(ka, kb, note, byAgent) {
   await send(b.chatId, b.threadId, msg, { md: true });
   let sb = live.get(kb);
   if (!sb) {
-    if (b.sessionId && (await externalSessions()).some(r => r.sessionId === b.sessionId)) { await send(b.chatId, b.threadId, '⚠️ 这个会话正在桌面 App 里开着，交接内容已贴在上面，关掉桌面后发「继续」即可。'); return 'target session is open in the desktop app; note posted, not started'; }
+    if (await onDesktop(b) && !live.get(kb)) await copyTopic(kb);
     sb = live.get(kb) || startSession(kb);
   }
   const content = [{ type: 'text', text: `${msg}\n\n${byAgent ? '这是另一个 agent 交给你的任务，按协作规则直接开始处理。' : '请先阅读这份交接说明，简要复述你接手后的理解和打算，然后等我确认。'}` }];
@@ -1887,9 +1953,9 @@ const collabTools = k => [
       }
       return { content: [{ type: 'text', text: r }] };
     }, { alwaysLoad: true }),
-  tool('open_project', '在 Telegram 里为一个项目目录开话题。fresh=false：接上这个目录最近一次的对话（相当于 continue）；fresh=true：开全新会话，目录不存在会创建。path 可以是绝对路径，或相对默认根目录的路径。ifOpen=fork：该目录最近的会话正在桌面 App 里开着时，复制一份带完整记忆的副本。返回话题链接，要转告用户。',
-    { path: z.string(), fresh: z.boolean().optional(), ifOpen: z.enum(['refuse', 'fork']).optional(), group: z.string().optional().describe('在哪个群开：群名或账号名（如 Claude_B_Win、Claude B、Codex）。不填 = 当前群') },
-    async ({ path: arg, fresh, ifOpen, group }) => {
+  tool('open_project', '在 Telegram 里为一个项目目录开话题。fresh=false：接上这个目录最近一次的对话（相当于 continue）；fresh=true：开全新会话，目录不存在会创建。path 可以是绝对路径，或相对默认根目录的路径。该目录最近的会话正在桌面 App 里开着时，自动复制一份带完整记忆的副本（原会话不受影响）。返回话题链接，要转告用户。',
+    { path: z.string(), fresh: z.boolean().optional(), group: z.string().optional().describe('在哪个群开：群名或账号名（如 Claude_B_Win、Claude B、Codex）。不填 = 当前群') },
+    async ({ path: arg, fresh, group }) => {
       const t = state.topics[k];
       let p; try { p = resolveDir(arg); } catch (e) { return { content: [{ type: 'text', text: e.message }], isError: true }; }
       if (!p) return { content: [{ type: 'text', text: 'empty path' }], isError: true };
@@ -1901,7 +1967,7 @@ const collabTools = k => [
         chatId = Number(hit[0]); agent = hit[1].agent;
       }
       if (!fs.existsSync(p)) { if (!fresh) return { content: [{ type: 'text', text: `目录不存在：${p}（新项目请用 fresh=true）` }], isError: true }; fs.mkdirSync(p, { recursive: true }); }
-      const r = await openProject(chatId, agent, p, { fresh: !!fresh, ifOpen: ifOpen || 'refuse' });
+      const r = await openProject(chatId, agent, p, { fresh: !!fresh });
       return { content: [{ type: 'text', text: `${r.text}${r.link ? '' : '（未打开）'}\n目录：${p}${r.key ? `\nhandoff 时 topic 填：${r.key}` : ''}` }] };
     }, { alwaysLoad: true }),
   tool('list_topics', '列出用户在 Telegram 里的所有项目话题（每个话题是另一个 agent 会话）：key | 群 | 标题 | 目录 | 状态。',
@@ -1955,7 +2021,7 @@ function readSidebar(dir) {
 async function cmdSync(chatId, g, arg = '') {
   const byAgent = {};
   for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) byAgent[a] = readSidebar(c.sidebarDir);
-  const have = new Set(Object.values(state.topics).map(t => t.sessionId).filter(Boolean));
+  const have = new Set(Object.values(state.topics).flatMap(t => [t.sessionId, t.forkFrom, t.copyOf]).filter(Boolean)); // copies count: the original has a topic
   // Same refusals as resolveDir (/open): never the hub's own folder (or one containing it), never a workspace root itself.
   const avail = (partitionSidebar(byAgent)[g.agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
     && !inside(HOME, r.cwd) && !inside(r.cwd, HOME) && !rootsAbs().some(x => norm(x) === norm(r.cwd)));
@@ -1974,14 +2040,18 @@ async function cmdSync(chatId, g, arg = '') {
     todo = avail.filter(r => r.cliSessionId === pickId);
   }
   if (todo.length > 1) await send(chatId, undefined, `开始同步 ${todo.length} 个会话，每个建一个话题，大约 ${Math.ceil(todo.length * 12 / 60)} 分钟（Telegram 限制每分钟发送条数）…`);
+  const open = new Set((await externalSessions()).map(r => r.sessionId)); // open on the desktop: the topic gets a copy (full memory)
   for (const r of todo) {
-    const t = await createTopic(chatId, g.agent, r.cwd, r.cliSessionId, r.title);
-    try { const pend = new Map(); for (const m of await getSessionMessages(r.cliSessionId)) noteOutputs(t, m, pend); save(); } catch {}
+    const copy = open.has(r.cliSessionId);
+    const t = await createTopic(chatId, g.agent, r.cwd, copy ? null : r.cliSessionId, copy ? `${r.title || path.basename(r.cwd)} ⑂` : r.title);
+    if (copy) { t.forkFrom = r.cliSessionId; save(); }
+    const ex = await loadRecap(t, r.cliSessionId);
     await refreshCard(key(chatId, t.threadId)).catch(e => log('card failed', e));
-    if (todo.length === 1) await send(chatId, undefined, `✅ 已同步「${t.title}」：${topicLink(chatId, t.threadId)}\n进话题直接发消息就能接着聊。桌面 App 里正开着这个会话的话，要先在桌面关掉。`);
+    await sendIntro(t, copy ? DESKTOP_COPY : `已同步桌面会话「${t.title}」。`, ex, `目录：${r.cwd}\n直接在这里发消息就能接着聊。`);
+    if (todo.length === 1) await send(chatId, undefined, `✅ 已同步「${t.title}」：${topicLink(chatId, t.threadId)}\n进话题直接发消息就能接着聊。${copy ? '桌面上正开着它，所以这是一份带完整记忆的副本，桌面那边不受影响。' : ''}`);
     else await new Promise(res => setTimeout(res, 10000)); // ponytail: fixed pacing under the 20 msg/min group limit
   }
-  if (todo.length > 1) await send(chatId, undefined, `✅ 同步完成：${todo.length} 个话题。进话题直接发消息就能接着聊。\n桌面 App 里正开着的会话，要先在桌面关掉才能在这里继续。`);
+  if (todo.length > 1) await send(chatId, undefined, `✅ 同步完成：${todo.length} 个话题。进话题直接发消息就能接着聊。\n桌面 App 里正开着的会话，同步的是带完整记忆的副本（标 ⑂），桌面那边不受影响。`);
 }
 
 // /mode [ask|auto] — in a project topic: that session; in General: default for this group's topics.
@@ -2133,10 +2203,20 @@ async function topicTurn(ctx, k, msgs) {
 
   let s = live.get(k);
   if (!s) {
-    if (t.sessionId && (await externalSessions()).some(r => r.sessionId === t.sessionId))
-      return send(t.chatId, t.threadId, '这个会话现在正在桌面 App 或终端里开着，先在电脑上关掉再发。');
+    if (await onDesktop(t)) { // choice: a newer message supersedes the card (and asks again)
+      const v = await askButtons(t.chatId, t.threadId, '这个会话现在正在桌面 App 或终端里开着，两边同时写会把记录弄乱。可以复制一份带完整记忆的副本在这里继续，桌面那边不受影响。',
+        [['📋 复制一份在这里继续', 'copy'], ['先不发', '']], false, { choice: true });
+      if (!v) return;
+      if (!live.get(k) && t.sessionId) await copyTopic(k, '📋 已复制一份带完整记忆的副本，在这里继续；桌面那边的对话不受影响。');
+    }
     s = live.get(k) || startSession(k); // re-check: a second message (album, quick follow-up) may have started it meanwhile
   }
+  // Owner messages steer the running turn instead of waiting behind it (hub-fed work — feed, handoffs, results — still queues).
+  if (s.busy && !s.closeAfter && await s.steer(content)) {
+    audit('steer', t.chatId, t.threadId ?? '-', s.codex ? 'codex' : 'claude');
+    return send(t.chatId, t.threadId, '💬 已插话：做完手头这一步就会看到（要立刻打断发 /stop）');
+  }
+  s = live.get(k) || startSession(k); // Codex steer failed (turn just ended) or the session closed meanwhile
   if (s.busy || s.queue.length) { s.queue.push(content); return send(t.chatId, t.threadId, `⏳ 已排队（${s.queue.length} 条），/stop 可清空`); }
   startTurn(k, content);
 }
@@ -2230,7 +2310,7 @@ async function onMessage(ctx) {
   if (cmd?.[1] === 'approvals') return cmdApprovals(chatId, threadId, cmd[2].trim());
   if (cmd?.[1] === 'clear' && !threadId) return cmdClear(chatId, undefined, false);
   if (cmd && ['open', 'new'].includes(cmd[1])) return cmdOpen(ctx, g, cmd[2], cmd[1] === 'new').catch(e => send(chatId, undefined, `⚠️ ${e.message}`));
-  if (cmd?.[1] === 'start') return send(chatId, threadId, '在「圣旨」里直接说你要做什么（比如“继续做 my-app”“新建一个项目 xxx”），或用 /open <目录> 接上已有项目，/new <目录> 开新项目。话题里直接发消息就是跟 agent 对话；图片（一次发多张也算一条）、图片文件、PDF 会直接给 agent 看。\n/mode 切换 ask（每个操作都问）/ auto（有风险才问）；/model 切换模型；/effort 调思考强度（按话题，下一轮起生效）；/account 换账号继续（额度快满时用）；/stop 停止当前这一轮；/get <路径> 取文件或文件夹（电脑上任意位置，文件夹打包成 zip；Hub 自己的目录和密钥类文件除外；圣旨里也能用）；/diff 看上一轮改了哪些代码（git 项目）；/screen [编号] 截这台电脑的屏幕（上朝里 /screen mac 截 Mac）；/shot <网址或端口> [宽度] 用无头浏览器截网页（只写端口 = 这台电脑的 localhost）；/status 看状态。\nagent 的回复按 Markdown 排版（代码块、表格、链接等）。每轮结束自动发来这一轮新建 / 改过的图片、PDF、文档等（最多直接发 3 个，多的点按钮取；config autoSendFiles: false 关闭）；git 项目还会附一条「📝 N 个文件 +a −b」改动摘要。\n/sync 把桌面侧边栏的会话同步成话题；/fork 带完整记忆复制到新话题（可换账号）；/handoff 把结论交给另一个话题；/move mac 把会话搬到另一台电脑（加 code 连代码一起带）；/approvals on|off 把这台电脑桌面 App 的权限请求推到手机；/clear（在圣旨里）清空本群消息和话题（记忆保留）。\n/panic 紧急停止这台电脑的所有会话、拒绝所有待批卡片并暂停（私聊、上朝或任何群都能发；在上朝发两台电脑都停）；/resume_hub 恢复。\n两台电脑配对后，跨机派活、结果、搬家包、更新包都带签名，签名不对的拒收；对方换了配对密钥会私聊问你接不接受。\n换令牌：在这台电脑 Hub 目录的 .env 里写一行「名字=新值」再重启 Hub（Windows 上令牌加密存在 .env.dpapi，新值优先用，稳定运行 2 分钟后自动加密搬过去）。');
+  if (cmd?.[1] === 'start') return send(chatId, threadId, '在「圣旨」里直接说你要做什么（比如“继续做 my-app”“新建一个项目 xxx”），或用 /open <目录> 接上已有项目，/new <目录> 开新项目。话题里直接发消息就是跟 agent 对话；图片（一次发多张也算一条）、图片文件、PDF 会直接给 agent 看。agent 正在做的时候再发消息 = 插话：它做完手头这一步就会看到，接着按你说的调整（要立刻打断发 /stop）。\n项目的会话正在电脑桌面 App 里开着时，会复制一份带完整记忆的副本在 Telegram 里继续（桌面那边不受影响），并贴出「📜 之前的对话」；/history [轮数] 取最近的对话记录（默认 10 轮，最多 50）。\n/mode 切换 ask（每个操作都问）/ auto（有风险才问）；/model 切换模型；/effort 调思考强度（按话题，下一轮起生效）；/account 换账号继续（额度快满时用）；/stop 停止当前这一轮；/get <路径> 取文件或文件夹（电脑上任意位置，文件夹打包成 zip；Hub 自己的目录和密钥类文件除外；圣旨里也能用）；/diff 看上一轮改了哪些代码（git 项目）；/screen [编号] 截这台电脑的屏幕（上朝里 /screen mac 截 Mac）；/shot <网址或端口> [宽度] 用无头浏览器截网页（只写端口 = 这台电脑的 localhost）；/status 看状态。\nagent 的回复按 Markdown 排版（代码块、表格、链接等）。每轮结束自动发来这一轮新建 / 改过的图片、PDF、文档等（最多直接发 3 个，多的点按钮取；config autoSendFiles: false 关闭）；git 项目还会附一条「📝 N 个文件 +a −b」改动摘要。\n/sync 把桌面侧边栏的会话同步成话题；/fork 带完整记忆复制到新话题（可换账号）；/handoff 把结论交给另一个话题；/move mac 把会话搬到另一台电脑（加 code 连代码一起带）；/approvals on|off 把这台电脑桌面 App 的权限请求推到手机；/clear（在圣旨里）清空本群消息和话题（记忆保留）。\n/panic 紧急停止这台电脑的所有会话、拒绝所有待批卡片并暂停（私聊、上朝或任何群都能发；在上朝发两台电脑都停）；/resume_hub 恢复。\n两台电脑配对后，跨机派活、结果、搬家包、更新包都带签名，签名不对的拒收；对方换了配对密钥会私聊问你接不接受。\n换令牌：在这台电脑 Hub 目录的 .env 里写一行「名字=新值」再重启 Hub（Windows 上令牌加密存在 .env.dpapi，新值优先用，稳定运行 2 分钟后自动加密搬过去）。');
   if (cmd?.[1] === 'screen') return cmdScreen(chatId, threadId, cmd[2]).catch(e => send(chatId, threadId, `⚠️ /screen 失败：${e.message}`));
   if (cmd?.[1] === 'shot') return cmdShot(chatId, threadId, cmd[2]).catch(e => send(chatId, threadId, `⚠️ /shot 失败：${e.message}`));
   if (!k) { // 「圣旨」(General): plain requests go to the dispatcher agent
@@ -2246,6 +2326,7 @@ async function onMessage(ctx) {
   if (cmd?.[1] === 'handoff') return cmdHandoff(k);
   if (cmd?.[1] === 'get') return cmdGet(state.topics[k], cmd[2].trim()).catch(e => send(chatId, threadId, `⚠️ ${e.message}`));
   if (cmd?.[1] === 'diff') return cmdDiff(k).catch(e => send(chatId, threadId, `⚠️ /diff 失败：${e.message}`));
+  if (cmd?.[1] === 'history') return cmdHistory(k, cmd[2].trim()).catch(e => send(chatId, threadId, `⚠️ /history 失败：${e.message}`));
   return onTopicMessage(ctx, k);
 }
 
@@ -2504,7 +2585,10 @@ export const peerAgeMin = (desc, now = Date.now(), machine) => {
   const line = machine ? String(desc || '').split('\n').find(l => l.includes(` ${machine} Hub `)) : desc;
   const at = Date.parse(HB_RE.exec(line || '')?.[1] || ''); return at ? (now - at) / 60000 : Infinity;
 };
+// Proactive "peer offline / back online" DMs are opt-in (config peerAlerts: true): a sleeping laptop needs no action, and a
+// task sent to an offline machine already gets "🏖 … 今天请假了" on the spot.
 async function watchPeers() {
+  if (!CFG.peerAlerts) return;
   for (const w of CFG.watch || []) {
     const desc = await bot.api.getChat(w.chatId || CFG.exchange).then(c => c.description || '', () => '');
     const age = peerAgeMin(desc, Date.now(), w.machine), down = age > 30;
