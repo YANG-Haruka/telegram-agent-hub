@@ -2961,7 +2961,13 @@ async function onDesktopPermission(req, gone) {
     ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, vertical, { onId: id => { wid = id; } })
     : askOwnerHere(html, opts, { vertical, onId: id => { wid = id; } });
   const [ch, th] = tk ? [state.topics[tk].chatId, state.topics[tk].threadId] : [Number(CFG.exchange), exThread('todo')];
-  const other = async question => { if (over) return null; await send(ch, th, `✏️ 请输入「${question}」的答案（这句不会当成新任务）：`, { reply_markup: { force_reply: true, input_field_placeholder: '输入你的答案…' } }); return waitFreeText(ch, th); };
+  // The prompt forces a reply (the input box opens on it); deleted once answered or given up, else the client stays stuck in
+  // "replying to" that prompt.
+  const other = async question => {
+    if (over) return null;
+    const p = await send(ch, th, `✏️ 请输入「${question}」的答案（这句不会当成新任务）：`, { reply_markup: { force_reply: true, input_field_placeholder: '输入你的答案…' } });
+    try { return await waitFreeText(ch, th); } finally { if (p) bot.api.deleteMessage(ch, p.message_id).catch(() => {}); }
+  };
   const typed = () => over ? Promise.resolve(null) : waitFreeText(ch, th), onTyped = txt => wid && finishWait(wid, -1, `✏️ 你的回答：${txt.slice(0, 200)}`);
   const flow = req.tool_name === 'AskUserQuestion' ? askQuestions(req.tool_input, where, ask, other, typed, onTyped).then(answers => answers && { answers })
     : ask(`🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny'], ['💻 回电脑上处理', '']]);
