@@ -25,9 +25,9 @@ if (!env.TELEGRAM_BOT_TOKEN) { console.error('TELEGRAM_BOT_TOKEN not found in .e
 const { exchange, machine: me, exchangeThreads } = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
 if (JSON.parse(fs.readFileSync(peerConfig, 'utf8')).machine !== machine) { console.error(`${peerConfig} is not ${machine}'s config`); process.exit(1); }
 
-const FILES = ['hub.mjs', 'package.json', 'package-lock.json', 'config.json'];
+const FILES = ['hub.mjs', 'package.json', 'package-lock.json', 'config.json', 'desktop-approve.js']; // the last: the Mac's site-approval clicker
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-bundle-'));
-for (const f of FILES.slice(0, 3)) fs.copyFileSync(path.join(ROOT, f), path.join(stage, f));
+for (const f of [...FILES.slice(0, 3), FILES[4]]) fs.copyFileSync(path.join(ROOT, f), path.join(stage, f));
 fs.copyFileSync(peerConfig, path.join(stage, 'config.json'));
 // Kept next to the hub: if the pairing is ever broken, post this file in the command group yourself (escape hatch, see README).
 const zip = path.join(ROOT, 'agent-hub.zip');

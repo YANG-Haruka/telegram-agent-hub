@@ -886,14 +886,14 @@ function webWait(t) {
 }
 // The desktop app's site-approval card, answered from Telegram: buttons in the topic; a tap runs desktop-approve.ps1, which
 // switches the app to the session and clicks the same button there, only if the card's site is the host shown here.
-// Windows only (UI Automation); on the Mac the notice just says to answer it at the computer.
+// Windows: UI Automation (desktop-approve.ps1); macOS: Accessibility via JXA (desktop-approve.js, needs Accessibility for node).
 const webCards = new Map(); // topic key → the open Telegram card
 function webCard(k, host, code = '') {
   const t = state.topics[k];
   const head = code // a JavaScript run is asked one by one (no "always"): show what it would run
     ? `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想在网页${host ? `「<b>${esc(host)}</b>」` : ''}上运行这段 JavaScript，点之前那个任务一直停着：\n<pre>${esc(clip(code, 900))}</pre>`
     : `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想操作网页${host ? `「<b>${esc(host)}</b>」` : ''}，桌面 App 弹了「是否允许 Claude 操作这个网站」，点之前那个任务一直停着。`;
-  if (process.platform !== 'win32') return send(t.chatId, t.threadId, `${head}\n这台电脑上只能去桌面 App 里点。`, { html: true });
+  if (!['win32', 'darwin'].includes(process.platform)) return send(t.chatId, t.threadId, `${head}\n这台电脑上只能去桌面 App 里点。`, { html: true });
   askButtons(t.chatId, t.threadId, `${head}\n在这里点，Hub 会在电脑上替你点同一个按钮（会把桌面 App 切到这个会话）。`,
     [['✅ 允许一次', 'once'], ...(code ? [] : [['✅ 总是允许这个网站', 'always']]), ['❌ 拒绝', 'deny'], ['💻 我去电脑上点', '']], true, { onId: id => webCards.set(k, id) })
     .then(v => { webCards.delete(k); if (v) return desktopApprove(k, v, host, code); })
@@ -902,7 +902,9 @@ function webCard(k, host, code = '') {
 function desktopApprove(k, action, host, code = '') {
   const t = state.topics[k], title = t.deskTitle || t.title;
   audit('web-approve', t.chatId, t.threadId, action, host || '?'); log('web approve', title, action, host);
-  return new Promise(res => execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HOME, 'desktop-approve.ps1'), '-Title', title, '-Action', action, '-ExpectHost', host || ''],
+  const [exe, args] = process.platform === 'darwin' ? ['osascript', ['-l', 'JavaScript', path.join(HOME, 'desktop-approve.js'), title, action, host || '']]
+    : ['powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HOME, 'desktop-approve.ps1'), '-Title', title, '-Action', action, '-ExpectHost', host || '']];
+  return new Promise(res => execFile(exe, args,
     { timeout: 60000, windowsHide: true }, (e, out) => { let r = {}; try { r = JSON.parse(String(out).trim().split('\n').pop()); } catch {} res(e && !r.note ? { note: e.message } : r); }))
     .then(r => {
       log('web approve result', JSON.stringify(r));
@@ -1573,11 +1575,20 @@ function resolveDir(arg) {
   if (roots.some(r => norm(path.resolve(r)) === norm(p))) throw new Error(`不能直接用根目录 ${p} 开话题：请在下面按项目或任务建一个子文件夹（例如 ${path.join(p, 'search')}，新任务用 fresh=true / /new）`);
   return p;
 }
+// One plain icon for every project topic (config topicIcon, an emoji from Telegram's topic icon set; default 💻) instead of
+// Telegram's coloured initial letters. Resolved once at start (getForumTopicIconStickers).
+let topicIconId = null;
+export async function loadTopicIcon() {
+  const want = CFG.topicIcon ?? '💻';
+  if (!want) return;
+  const st = await bot.api.getForumTopicIconStickers().catch(() => []);
+  topicIconId = st.find(x => x.emoji?.replace(/️/g, '') === want.replace(/️/g, ''))?.custom_emoji_id || null;
+}
 async function createTopic(chatId, agent, cwd, sessionId, wanted) {
   const base = (wanted || path.basename(cwd) || cwd).slice(0, 100);
   const taken = new Set(Object.values(state.topics).filter(t => t.chatId === chatId && !t.deleted).map(t => t.title));
   let title = base; for (let n = 2; taken.has(title); n++) title = `${base} #${n}`;
-  const ft = await bot.api.createForumTopic(chatId, title);
+  const ft = await bot.api.createForumTopic(chatId, title, ...(topicIconId ? [{ icon_custom_emoji_id: topicIconId }] : []));
   const k = key(chatId, ft.message_thread_id);
   state.topics[k] = { chatId, threadId: ft.message_thread_id, agent, cwd, sessionId: sessionId || null, title, busy: false };
   markMirror(state.topics[k]); save();
@@ -2204,11 +2215,71 @@ function docRejected(m, file, what) {
 
 export const isPeerBot = (u, peers = CFG.peerBots || []) => peers.some(p => String(p) === String(u.id) || String(p).replace(/^@/, '').toLowerCase() === String(u.username || '').toLowerCase());
 // The other machine's bot said something in 上朝: act on what is addressed to this machine.
+// /selftest: what this hub can check about itself without anyone at the computer, as one message (to 🤖 机器通道 when the
+// other hub asked, else where the owner typed it). Read-only; never prints tokens (hooks: url + timeout only).
+async function selfTest() {
+  const L = [`🩺 ${CFG.machine} 自检 · v${HUB_VERSION} · ${process.platform}`], ok = (b, s) => L.push(`${b ? '✅' : '❌'} ${s}`);
+  try {
+    const h = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'settings.json'), 'utf8').replace(/^\uFEFF/, '')).hooks || {};
+    for (const ev of ['PermissionRequest', 'UserPromptSubmit']) { const x = (h[ev] || []).flatMap(e => e?.hooks || []).find(y => /127\.0\.0\.1/.test(y.url || '')); ok(!!x, `${ev} 钩子${x ? `：${x.url.replace(/^.*\//, '/')} timeout ${x.timeout}` : '没装（/approvals on）'}`); }
+  } catch (e) { ok(false, `读不了 ~/.claude/settings.json：${e.message}`); }
+  const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? null : JSON.parse(out)); } catch { res(null); } }));
+  ok(!!rows, rows ? `claude agents：${rows.filter(r => r.kind === 'interactive').length} 个桌面 / 终端会话` : 'claude agents 跑不起来');
+  for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) { const n = readSidebar(c.sidebarDir).length; ok(n > 0, `${c.label} 侧边栏：${n} 个会话`); }
+  const ts = Object.values(state.topics).filter(t => !t.deleted && !t.isDispatcher);
+  L.push(`📋 话题 ${ts.length} 个：${ts.map(t => t.shownName || t.title).join('、').slice(0, 600)}`);
+  try {
+    const log = fs.readFileSync(path.join(HOME, 'logs', `hub-${new Date().toISOString().slice(0, 10)}.log`), 'utf8');
+    const n = re => (log.match(re) || []).length;
+    L.push(`📈 今天：自动建话题 ${n(/auto-synced/g)} · 改名 ${n(/topic renamed from desktop/g)} · 状态灯 ${n(/status line deleted/g)} · 补记忆 ${n(/desktop told/g)} · 桌面权限卡 ${n(/hook \/permission/g)} · 网页授权点击 ${n(/web approve result/g)} · 出错 ${n(/failed/g)}`);
+  } catch { L.push('📈 今天还没有日志'); }
+  if (process.platform === 'darwin') { // the site-approval click needs UI scripting (Accessibility) for the hub's node
+    const r = await new Promise(res => execFile('osascript', ['-e', 'tell application "System Events" to get name of every window of (first process whose name is "Claude")'], { timeout: 20000 }, (e, out, err) => res(e ? `${err || e.message}`.trim() : `ok: ${out.trim()}`)));
+    ok(r.startsWith('ok'), `辅助功能（点网页授权要用）：${r.slice(0, 200)}`);
+  }
+  return L.join('\n');
+}
+// /tidy: delete the forum topics in this machine's groups that the hub doesn't know (old tests). Bots can't list topics:
+// probe the newest id, try every other id below it.
+async function tidyTopics() {
+  const out = [];
+  for (const [chatId, g] of ownGroups()) {
+    const probe = await bot.api.sendMessage(Number(chatId), '🧹', { disable_notification: true }).catch(() => null);
+    if (!probe) { out.push(`${g.title}：发不了消息`); continue; }
+    await bot.api.deleteMessage(Number(chatId), probe.message_id).catch(() => {});
+    const keep = new Set(Object.values(state.topics).filter(t => String(t.chatId) === chatId && !t.deleted && t.threadId).map(t => t.threadId));
+    let n = 0;
+    for (let id = 2; id < probe.message_id; id++) if (!keep.has(id) && await bot.api.deleteForumTopic(Number(chatId), id).then(() => true, () => false)) n++;
+    out.push(`${g.title}：删了 ${n} 个，留下 ${keep.size} 个`);
+  }
+  return `🧹 ${CFG.machine} 清理多余话题：${out.join('；')}`;
+}
+// avatar: the photo the other hub attached (signed over its bytes, checked like an update bundle) becomes this machine's
+// group photo(s); the other hub isn't in these groups and can't set it itself.
+async function setAvatarFrom(m) {
+  if (!m?.document) return `⚠️ ${CFG.machine}：换头像的消息里没有图片`;
+  const f = await download(m.document.file_id, 'update', m.document.file_name || 'avatar.png');
+  if (docRejected(m, f, m.document.file_name)) return `⚠️ ${CFG.machine}：头像图片签名不对，没换`;
+  const done = [];
+  for (const [chatId, g] of ownGroups()) if (await bot.api.setChatPhoto(Number(chatId), new InputFile(f)).then(() => true, e => (log('set avatar failed', e.description), false))) done.push(g.title);
+  return `🖼 ${CFG.machine} 换好了群头像：${done.join('、') || '（没有成功的）'}`;
+}
+async function runControl(cmd, arg, m) {
+  const probe = () => new Promise(res => execFile('osascript', ['-l', 'JavaScript', path.join(HOME, 'desktop-approve.js'), '--probe', ...(arg ? [arg] : [])], { timeout: 120000 },
+    (e, out, err) => res(`🔎 ${CFG.machine} 界面探测${arg ? `（切到「${arg}」）` : ''}：\n${(String(out).trim() || String(err || e?.message || '').trim()).slice(0, 3500)}`)));
+  const text = await (cmd === 'selftest' ? selfTest() : cmd === 'tidy' ? tidyTopics() : cmd === 'avatar' ? setAvatarFrom(m) : probe()).catch(e => `⚠️ ${CFG.machine} ${cmd} 失败：${e.message}`);
+  return send(CFG.exchange, exThread('machine'), text);
+}
+// The other machine runs cmd and answers in 🤖 机器通道.
+export async function sendControlFile(machine, cmd, file) { await postToExchange({ to: machine, file, caption: `🛠 → ${machine} ${cmd}` }); }
+export async function sendControl(machine, cmd, arg) { await postToExchange({ to: machine, text: `🛠 → ${machine} ${cmd}${arg ? ` ${arg}` : ''}` }); }
 async function onPeerMessage(m) {
   const raw = m.text || m.caption || '', sg = splitSig(raw), text = sg.body, doc = m.document, r = m.text ? parseRelay(text, CFG.machine) : null;
   const pk = /^🔑 → (\S+) ([A-Za-z0-9+/]+=*)$/u.exec(raw.trim());
   if (pk) return pk[1] === CFG.machine ? onPeerKey(pk[2]) : undefined;
-  if (!r && !(doc && text.split('\n')[0].includes(`→ ${CFG.machine}`))) return; // its acks, reports, items for someone else
+  const ctl = /^🛠 → (\S+) (selftest|tidy|axprobe|avatar)(?: (.{1,100}))?$/u.exec(text.trim()); // the other hub asks this one to check / tidy itself
+  if (ctl && ctl[1] !== CFG.machine) return;
+  if (!r && !ctl && !(doc && text.split('\n')[0].includes(`→ ${CFG.machine}`))) return; // its acks, reports, items for someone else
   const isBundle = /^agent-hub(-mac)?\.zip$/i.test(doc?.file_name || '');
   state.relayed ??= [];
   if (state.relayed.includes(m.message_id)) return;
@@ -2219,11 +2290,12 @@ async function onPeerMessage(m) {
   // Only what arrives while we're online counts: anything older than 10 min (sent while this hub was down) is dropped, and
   // said so in 上朝 (the sender may be waiting for it); an update bundle is still installed, so a machine that was off comes
   // back on the newest version.
-  const what = r?.kind === 'result' ? `${r.body.split('\n')[0].slice(0, 80)}` : r ? `@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}` : text.split('\n')[0].slice(0, 80);
+  const what = ctl ? `🛠 ${ctl[2]}` : r?.kind === 'result' ? `${r.body.split('\n')[0].slice(0, 80)}` : r ? `@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}` : text.split('\n')[0].slice(0, 80);
   audit('peer', r?.kind || doc?.file_name || '?');
   if (!isBundle && m.date < Date.now() / 1000 - 600) return send(CFG.exchange, exThread('machine'), `⏭ ${CFG.machine} 上线晚了，过期未处理：${what}`);
   // After /panic nothing from the other machine runs here (tasks, results, move / update bundles) until /resume_hub.
   if (state.paused) return send(CFG.exchange, exThread('machine'), `⏸ ${CFG.machine} 已紧急停止（/panic），没有处理：${what}`);
+  if (ctl) return runControl(ctl[2], ctl[3], m);
   if (r?.kind === 'result') return deliverResult(r.key, r.body);
   if (r) {
     await send(CFG.exchange, exThread('machine'), `📥 ${CFG.machine} 收到：@${r.alias} ${r.task.split('\n')[0].slice(0, 80)}`);
@@ -2591,8 +2663,15 @@ bot.on('message', ctx => { onMessage(ctx).catch(e => log('message handler failed
 const seenUnknown = new Set();
 async function onMessage(ctx) {
   const m = ctx.message, chatId = ctx.chat.id;
-  if (m.forum_topic_edited) { // our status renames: drop the service line; the owner's rename: the new bare title
-    if (ctx.from?.id === bot.botInfo?.id) return bot.api.deleteMessage(chatId, m.message_id).then(() => log('status line deleted', chatId, m.message_thread_id), e => log('status line delete failed', e.description || e.message));
+  if (m.forum_topic_edited) { // our status renames: keep only the newest service line; the owner's rename: the new bare title
+    if (ctx.from?.id === bot.botInfo?.id) {
+      // Clients apply a topic's new name from this line: deleting it at once left them showing the old status. So the
+      // previous line goes when the next one arrives, and the newest stays (one grey line per topic at most).
+      const k = key(chatId, m.message_thread_id), prev = (state.statusLines ??= {})[k];
+      state.statusLines[k] = m.message_id; save();
+      if (prev) bot.api.deleteMessage(chatId, prev).then(() => log('status line deleted', chatId, m.message_thread_id), e => log('status line delete failed', e.description || e.message));
+      return;
+    }
     const t = state.topics[key(chatId, m.message_thread_id)];
     if (t && ctx.from?.id === OWNER && m.forum_topic_edited.name) { t.title = stripMark(m.forum_topic_edited.name); t.shownName = m.forum_topic_edited.name; save(); refreshCardSoon(key(chatId, m.message_thread_id), 500); }
     return;
@@ -2650,6 +2729,8 @@ async function onMessage(ctx) {
       return (bundleChain = bundleChain.then(() => installBundle(m, m.document, true)).catch(e => log('self-update failed', e)));
     }
     if (c?.[1] === 'stop') return cmdStop(ck);
+    if (c?.[1] === 'selftest') return send(chatId, undefined, await selfTest());
+    if (c?.[1] === 'tidy') return send(chatId, undefined, await tidyTopics());
     if (c?.[1] === 'clear') return cmdClear(chatId, undefined, true); // "/clear mac" → the Mac clears its groups
     if (c?.[1] === 'approvals') return cmdApprovals(chatId, undefined, text.slice(c[0].length).trim()); // "/approvals on mac" → the Mac
     if (c?.[1] === 'screen') return cmdScreen(chatId, undefined, text.slice(c[0].length)).catch(e => send(chatId, undefined, `⚠️ /screen 失败：${e.message}`)); // "/screen mac" → the Mac
@@ -3008,6 +3089,7 @@ async function watchPeers() {
 
 // ---------- self-update from a bundle the Windows hub posts in 上朝 (config selfUpdate=true, i.e. the Mac) ----------
 const BUNDLE_FILES = ['hub.mjs', 'package.json', 'package-lock.json', 'config.json'];
+const BUNDLE_EXTRA = ['desktop-approve.js']; // installed when the bundle carries them (older bundles don't)
 async function receiveBundle(m, doc) {
   if (doc.file_unique_id === state.lastBundle || m.date <= (state.lastBundleAt || 0)) return; // already installed, or older than it
   const v = await askOwner(`🔄 收到 ${esc(CFG.machine)} Hub 更新包：${esc(m.caption || doc.file_name)}（${Math.round((doc.file_size || 0) / 1024)} KB）。安装吗？`, [['✅ 安装', 'y'], ['❌ 不装', 'n']]);
@@ -3046,6 +3128,7 @@ async function installBundle(pm, doc, byOwner = false) {
     const npmCi = () => execFileP('npm', ['ci', '--no-audit', '--no-fund'], { cwd: HOME, timeout: 600000, shell: process.platform === 'win32' });
     state.verifyUpdate = true; state.updateBoots = 0; save(); // before the copy: a crash halfway still boots under the rollback guard
     for (const f of BUNDLE_FILES) fs.copyFileSync(path.join(dir, f), path.join(HOME, f)); // .env, state.json, logins untouched
+    for (const f of BUNDLE_EXTRA) if (fs.existsSync(path.join(dir, f))) fs.copyFileSync(path.join(dir, f), path.join(HOME, f));
     rmTemp();
     if (!lockSame) try { await npmCi(); } catch (e) { // roll back to prev/ (files and dependencies)
       for (const f of BUNDLE_FILES) fs.copyFileSync(path.join(prev, f), path.join(HOME, f));
@@ -3172,7 +3255,9 @@ if (IS_MAIN) {
   const POLL = { allowed_updates: ['message', 'callback_query'], onStart: me => {
     if (started) return log('poller restarted');
     started = true;
-    log(`hub started as @${me.username} v${HUB_VERSION}`); refreshPanels(); heartbeat().then(() => setTimeout(watchPeers, 60e3)); dailyChecks(); announceUnpaired();
+    log(`hub started as @${me.username} v${HUB_VERSION}`);
+    loadTopicIcon().then(async () => { if (!topicIconId) return; for (const t of Object.values(state.topics)) if (!t.deleted && !t.isDispatcher && t.threadId && t.iconId !== topicIconId && ownGroups().some(([id]) => id === String(t.chatId)))
+      await bot.api.editForumTopic(t.chatId, t.threadId, { icon_custom_emoji_id: topicIconId }).then(() => { t.iconId = topicIconId; save(); }, e => /NOT_MODIFIED/.test(e.description || '') ? (t.iconId = topicIconId, save()) : log('topic icon failed', e.description || e.message)); }).catch(e => log('topic icon failed', e.message)); refreshPanels(); heartbeat().then(() => setTimeout(watchPeers, 60e3)); dailyChecks(); announceUnpaired();
     if (state.paused) notifyOwner(`${pausedNote()}（Hub 刚重启过，仍在暂停中）`, { disable_notification: false });
     if (state.rolledBack) { state.rolledBack = false; save(); notifyOwner(`⚠️ ${CFG.machine} Hub 的新版本反复启动失败，已自动退回上一个版本（v${HUB_VERSION}）。`); }
     // start-hub.vbs put good/hub.mjs back after 3 quick crashes: the edited version is not running, say so.
