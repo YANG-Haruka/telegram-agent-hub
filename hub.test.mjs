@@ -506,11 +506,14 @@ test('hub-admin topics may touch the hub code, never its secrets', () => {
 });
 test('a browser call with no result is the desktop app waiting for a site approval', () => {
   const L = o => JSON.stringify(o);
-  const call = name => L({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input: {} }] } });
-  assert.equal(pendingWebCall([L({ type: 'user', message: { content: 'go' } }), call('mcp__Claude_Browser__javascript_tool'), L({ type: 'attachment' })].join('\n')), 'javascript_tool');
-  assert.equal(pendingWebCall([call('mcp__claude-in-chrome__navigate')].join('\n')), 'navigate');
+  const call = (name, id = name, input = {}) => L({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
+  const result = id => L({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } });
+  assert.deepEqual(pendingWebCall([L({ type: 'user', message: { content: 'go' } }), call('mcp__Claude_Browser__javascript_tool', 'j', { text: 'x()' }), L({ type: 'attachment' })].join('\n')), { tool: 'javascript_tool', input: { text: 'x()' } });
+  assert.equal(pendingWebCall([call('mcp__claude-in-chrome__navigate')].join('\n')).tool, 'navigate');
   assert.equal(pendingWebCall([call('Bash')].join('\n')), null);
-  assert.equal(pendingWebCall([call('mcp__Claude_Browser__navigate'), L({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } })].join('\n')), null);
+  assert.equal(pendingWebCall([call('mcp__Claude_Browser__navigate', 'n'), result('n')].join('\n')), null);
+  // a navigate answered after the javascript call that followed it: the javascript call still waits
+  assert.equal(pendingWebCall([call('mcp__Claude_Browser__navigate', 'n'), call('mcp__Claude_Browser__javascript_tool', 'j'), result('n')].join('\n')).tool, 'javascript_tool');
 });
 import { lastHost } from './hub.mjs';
 test('the site a stuck browser agent was on: the last navigated URL', () => {

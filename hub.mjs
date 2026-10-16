@@ -847,10 +847,20 @@ export function bgScan(text, open = new Set()) {
 // A browser / computer-use call that got no result for 90 s in the session or its background agents (workflows, subagents):
 // the desktop app is showing its own "allow Claude to act on this site" dialog, which no hook can answer from the phone.
 const WEB_TOOL = /Claude_Browser__|claude-in-chrome__|computer-use__|^computer$/;
+// The last browser call in a transcript tail that has no result yet (calls of one message run one by one: a navigate can
+// be answered while the javascript call after it still waits): { tool, input } or null.
 export function pendingWebCall(tail) {
-  const rows = tail.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(m => m?.type === 'user' || m?.type === 'assistant');
-  const m = rows.at(-1), u = m?.type === 'assistant' && Array.isArray(m.message?.content) && m.message.content.find(b => b.type === 'tool_use');
-  return u && WEB_TOOL.test(u.name) ? u.name.replace(/^mcp__[^_]+(_[^_]+)*__/, '') : null;
+  const uses = [], done = new Set();
+  for (const l of tail.split('\n')) {
+    let m; try { m = JSON.parse(l); } catch { continue; }
+    if (!Array.isArray(m?.message?.content)) continue;
+    for (const b of m.message.content) {
+      if (m.type === 'assistant' && b.type === 'tool_use' && WEB_TOOL.test(b.name)) uses.push(b);
+      if (m.type === 'user' && b.type === 'tool_result') done.add(b.tool_use_id);
+    }
+  }
+  const u = uses.filter(b => !done.has(b.id)).at(-1);
+  return u ? { tool: u.name.replace(/^mcp__[^_]+(_[^_]+)*__/, ''), input: u.input || {} } : null;
 }
 // The host of the last URL a transcript's browser calls navigated to (input.url), or ''.
 export function lastHost(text) {
@@ -867,8 +877,8 @@ function webWait(t) {
     if (now - st.mtimeMs < 90e3 || now - st.mtimeMs > 6 * 3600e3) continue;
     const n = Math.min(st.size, 65536), buf = Buffer.alloc(n), fd = fs.openSync(f, 'r');
     try { fs.readSync(fd, buf, 0, n, st.size - n); } finally { fs.closeSync(fd); }
-    const tool = pendingWebCall(buf.toString('utf8'));
-    if (tool) return { key: `${tool}@${path.basename(f)}@${Math.round(st.mtimeMs)}`, host: lastHost(fs.readFileSync(f, 'utf8')) };
+    const p = pendingWebCall(buf.toString('utf8'));
+    if (p) return { key: `${p.tool}@${path.basename(f)}@${Math.round(st.mtimeMs)}`, host: lastHost(fs.readFileSync(f, 'utf8')), tool: p.tool, code: p.tool === 'javascript_tool' ? String(p.input.text || '') : '' };
   }
   return null;
 }
@@ -876,16 +886,18 @@ function webWait(t) {
 // switches the app to the session and clicks the same button there, only if the card's site is the host shown here.
 // Windows only (UI Automation); on the Mac the notice just says to answer it at the computer.
 const webCards = new Map(); // topic key → the open Telegram card
-function webCard(k, host) {
+function webCard(k, host, code = '') {
   const t = state.topics[k];
-  const head = `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想操作网页${host ? `「<b>${esc(host)}</b>」` : ''}，桌面 App 弹了「是否允许 Claude 操作这个网站」，点之前那个任务一直停着。`;
+  const head = code // a JavaScript run is asked one by one (no "always"): show what it would run
+    ? `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想在网页${host ? `「<b>${esc(host)}</b>」` : ''}上运行这段 JavaScript，点之前那个任务一直停着：\n<pre>${esc(clip(code, 900))}</pre>`
+    : `🖥 <b>电脑上有个网页授权在等你</b>：Claude 想操作网页${host ? `「<b>${esc(host)}</b>」` : ''}，桌面 App 弹了「是否允许 Claude 操作这个网站」，点之前那个任务一直停着。`;
   if (process.platform !== 'win32') return send(t.chatId, t.threadId, `${head}\n这台电脑上只能去桌面 App 里点。`, { html: true });
   askButtons(t.chatId, t.threadId, `${head}\n在这里点，Hub 会在电脑上替你点同一个按钮（会把桌面 App 切到这个会话）。`,
-    [['✅ 允许一次', 'once'], ['✅ 总是允许这个网站', 'always'], ['❌ 拒绝', 'deny'], ['💻 我去电脑上点', '']], true, { onId: id => webCards.set(k, id) })
-    .then(v => { webCards.delete(k); if (v) return desktopApprove(k, v, host); })
+    [['✅ 允许一次', 'once'], ...(code ? [] : [['✅ 总是允许这个网站', 'always']]), ['❌ 拒绝', 'deny'], ['💻 我去电脑上点', '']], true, { onId: id => webCards.set(k, id) })
+    .then(v => { webCards.delete(k); if (v) return desktopApprove(k, v, host, code); })
     .catch(e => log('web card failed', e.stack || e.message));
 }
-function desktopApprove(k, action, host) {
+function desktopApprove(k, action, host, code = '') {
   const t = state.topics[k], title = t.deskTitle || t.title;
   audit('web-approve', t.chatId, t.threadId, action, host || '?'); log('web approve', title, action, host);
   return new Promise(res => execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HOME, 'desktop-approve.ps1'), '-Title', title, '-Action', action, '-ExpectHost', host || ''],
@@ -894,8 +906,8 @@ function desktopApprove(k, action, host) {
       log('web approve result', JSON.stringify(r));
       const did = { once: '允许一次', always: '总是允许', deny: '拒绝' }[action];
       if (r.ok) return send(t.chatId, t.threadId, `✅ 已在电脑上点了「${did}」：${r.url}`);
-      if (r.note === 'host-mismatch') { const real = (() => { try { return new URL(r.url).host; } catch { return ''; } })(); send(t.chatId, t.threadId, `⚠️ 弹窗里的网站其实是 ${r.url}，和上面写的不一样，所以没点。按新的再确认一次：`); return webCard(k, real); }
-      const why = { 'no-card': '弹窗已经不在了（可能已经有人点过）', 'no-session': `桌面 App 里没找到「${title}」这个会话`, 'no-allow-once': '没找到「允许一次」这个选项', covered: '那个按钮被别的窗口挡住了（或电脑锁屏了）' }[r.note] || r.note;
+      if (r.note === 'host-mismatch') { const real = (() => { try { return new URL(/^https?:/.test(r.url) ? r.url : `https://${r.url}`).host; } catch { return ''; } })(); send(t.chatId, t.threadId, `⚠️ 弹窗里的网站其实是 ${r.url}，和上面写的不一样，所以没点。按新的再确认一次：`); return webCard(k, real, code); }
+      const why = { 'no-card': '弹窗已经不在了（可能已经有人点过）', 'no-session': `桌面 App 里没找到「${title}」这个会话`, 'no-allow-once': '没找到「允许一次」这个选项', 'no-always': '这个弹窗没有「总是允许」', 'no-button': '弹窗上没找到这个按钮', covered: '那个按钮被别的窗口挡住了（或电脑锁屏了）' }[r.note] || r.note;
       return send(t.chatId, t.threadId, `⚠️ 没点成：${why}。请去电脑上处理。`);
     });
 }
@@ -921,7 +933,7 @@ async function deskStatus() {
   for (const t of Object.values(state.topics)) if (t.sessionId && !t.isDispatcher && !t.deleted && !t.closed && !isCodex(t) && running.has(t.sessionId)) {
     bgTrack(t); if (t.bgOpen?.length) deskBg.add(t.sessionId);
     const w = webWait(t), k = Object.keys(state.topics).find(x => state.topics[x] === t);
-    if (w && t.webNoted !== w.key) { t.webNoted = w.key; webCard(k, w.host); }
+    if (w && t.webNoted !== w.key) { t.webNoted = w.key; webCard(k, w.host, w.code); }
     t.webWait = w?.key || null;
   }
   for (const t of Object.values(state.topics)) if (t.webWait && !running.has(t.sessionId)) t.webWait = null;
