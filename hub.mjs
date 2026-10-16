@@ -1035,6 +1035,56 @@ function switchAccount(k, acct) {
 // with a copy (t.forkFrom: full memory, first start forks it); the desktop conversation is untouched.
 const onDesktop = async t => !!t.sessionId && !isCodex(t) && (await externalSessions()).some(r => r.sessionId === t.sessionId);
 const DESKTOP_COPY = '📋 这个会话正在桌面 App 或终端里开着，已复制一份带完整记忆的副本在这里继续；桌面那边的对话不受影响。';
+// Owner messages take the session over from the desktop app instead: its CLI process for this session (a child of the
+// Claude app — never a terminal's or the hub's own) is closed once idle there, and the topic goes on with the same session.
+// The window and history stay; the app starts a new process from the transcript (Telegram turns included) on its next
+// message there. Busy there → waits for that turn to end (6 h max). false: nothing taken over (not open in the app).
+export const DESKTOP_APP = /[\\/]WindowsApps[\\/]Claude_[^\\/]*[\\/]app[\\/]claude\.exe$|[\\/]Claude\.app[\\/]/i;
+const parentExe = pid => new Promise(res => process.platform === 'win32'
+  ? execFile('powershell', ['-NoProfile', '-Command', `$c = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; (Get-CimInstance Win32_Process -Filter "ProcessId=$($c.ParentProcessId)").ExecutablePath`], { timeout: 15000, windowsHide: true }, (e, out) => res(e ? '' : out.trim()))
+  : execFile('sh', ['-c', `ps -o comm= -p "$(ps -o ppid= -p ${pid})"`], { timeout: 5000 }, (e, out) => res(e ? '' : out.trim())));
+export async function desktopProc(sessionId) {
+  const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
+  for (const r of rows) if (r.sessionId === sessionId && r.kind === 'interactive' && Number.isInteger(r.pid) && alive(r.pid) && DESKTOP_APP.test(await parentExe(r.pid))) return r;
+  return null;
+}
+// A turn started elsewhere (the desktop) after the hub's last one: transcript bytes past t.mirrorAt holding a typed (or
+// self-woken) user line. Not the hub's own trailing bookkeeping lines.
+function wroteElsewhere(t) {
+  try {
+    const f = transcriptPath(t), size = fs.statSync(f).size;
+    if (t.mirrorSid !== t.sessionId || !(size > t.mirrorAt)) return false;
+    const buf = Buffer.alloc(Math.min(size - t.mirrorAt, 4 * 1048576)), fd = fs.openSync(f, 'r');
+    try { fs.readSync(fd, buf, 0, buf.length, t.mirrorAt); } finally { fs.closeSync(fd); }
+    const msgs = buf.toString('utf8').split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(m => (m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain);
+    return exchanges(msgs, 1, true).length > 0;
+  } catch { return false; }
+}
+const takeovers = new Map(); // topic key → the running takeover (a second message waits for the same one)
+function desktopTakeover(k) {
+  if (!takeovers.has(k)) takeovers.set(k, (async () => {
+    const t = state.topics[k], wait = ms => new Promise(r => setTimeout(r, ms));
+    if (!t.sessionId || isCodex(t)) return false;
+    let told = false;
+    for (const end = Date.now() + 6 * 3600e3; Date.now() < end; await wait(10e3)) {
+      const r = await desktopProc(t.sessionId);
+      if (!r) return told; // closed there meanwhile
+      if (r.status !== 'idle') {
+        if (!told) { told = true; await send(t.chatId, t.threadId, '⏳ 桌面上这个会话正在跑，等这一轮做完就接管过来，接着处理你的消息。'); }
+        continue;
+      }
+      try { process.kill(r.pid); } catch {}
+      for (let i = 0; i < 20 && alive(r.pid); i++) await wait(250);
+      if (alive(r.pid)) return false;
+      log('took over from the desktop app', t.sessionId); audit('takeover', t.chatId, t.threadId);
+      await send(t.chatId, t.threadId, '🖥 已从桌面接管这个会话，在这里接着做；回桌面再发消息会自动接上（包括这里聊的）。', { disable_notification: true });
+      return true;
+    }
+    return false;
+  })().finally(() => takeovers.delete(k)));
+  return takeovers.get(k);
+}
 async function copyTopic(k, head = DESKTOP_COPY) {
   const t = state.topics[k], from = t.sessionId;
   if (!from) return; // two callers raced past onDesktop (both await it): the first already copied, keep its forkFrom
@@ -1600,6 +1650,7 @@ async function mirrorDesktop() {
       // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
       if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) continue;
       t.mirrorAt = at + r.used; save();
+      const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
       const msgs = r.ex.length > 3 ? [`🖥 桌面上新增了 ${r.ex.length} 轮对话，/history 查看`] : r.ex.map(mirrorHtml);
       for (const h of msgs) await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
     }
@@ -2330,8 +2381,10 @@ async function topicTurn(ctx, k, msgs) {
   for (const [id, w] of waits) if (w.choice && w.chatId === t.chatId && w.threadId === t.threadId) finishWait(id, -1, '↪ 没选，按新消息处理');
 
   let s = live.get(k);
+  // The desktop wrote since our last turn (its next message after a takeover): our idle process remembers less, drop it.
+  if (s && !s.busy && !isCodex(t) && wroteElsewhere(t)) { closeLive(k); s = null; }
   if (!s) {
-    if (await onDesktop(t)) { // choice: a newer message supersedes the card (and asks again)
+    if (!await desktopTakeover(k) && await onDesktop(t)) { // terminal / background agent: copy. choice: a newer message supersedes the card
       const v = await askButtons(t.chatId, t.threadId, '这个会话现在正在桌面 App 或终端里开着，两边同时写会把记录弄乱。可以复制一份带完整记忆的副本在这里继续，桌面那边不受影响。',
         [['📋 复制一份在这里继续', 'copy'], ['先不发', '']], false, { choice: true });
       if (!v) return;

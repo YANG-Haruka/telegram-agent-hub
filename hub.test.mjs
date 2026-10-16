@@ -435,3 +435,11 @@ test('desktop mirror: new transcript bytes → finished exchanges and the bytes 
   assert.equal(mirrorHtml({ user: '<a>', reply: 'b&c' }), '🖥 桌面：\n<b>你：</b>&lt;a&gt;\n<b>Claude：</b>b&amp;c');
   assert.ok(mirrorHtml({ user: 'q', reply: '<'.repeat(9000) }).length <= 4000);
 });
+
+import { DESKTOP_APP } from "./hub.mjs";
+test("takeover only touches CLI processes the Claude desktop app started", () => {
+  for (const p of [String.raw`C:\Program Files\WindowsApps\Claude_2.42304.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe`, "/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"])
+    assert.ok(DESKTOP_APP.test(p), p);
+  for (const p of [String.raw`C:\Program Files\PowerShell\7\pwsh.exe`, String.raw`C:\Users\u\.local\bin\claude.exe`, String.raw`C:\Program Files\nodejs\node.exe`, "/bin/zsh", "/usr/local/bin/node", ""])
+    assert.ok(!DESKTOP_APP.test(p), p);
+});
