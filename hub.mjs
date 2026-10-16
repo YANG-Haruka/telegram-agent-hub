@@ -2095,12 +2095,15 @@ function readSidebar(dir) {
   return rows;
 }
 // An agent's sidebar sessions without a topic (deleted topics count: a session whose topic you deleted stays out).
-function unsynced(agent) {
+function sidebarRows() {
   const byAgent = {};
   for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) byAgent[a] = readSidebar(c.sidebarDir);
+  return partitionSidebar(byAgent);
+}
+function unsynced(agent) {
   const have = new Set(Object.values(state.topics).flatMap(t => [t.sessionId, t.forkFrom, t.copyOf]).filter(Boolean)); // copies count: the original has a topic
   // Same refusals as resolveDir (/open): never the hub's own folder (or one containing it), never a workspace root itself.
-  return (partitionSidebar(byAgent)[agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
+  return (sidebarRows()[agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
     && !inside(HOME, r.cwd) && !inside(r.cwd, HOME) && !rootsAbs().some(x => norm(x) === norm(r.cwd)));
 }
 // Sessions created in the desktop app after state.autoSyncFrom (set on the first run: nothing older is pulled in) get a topic
@@ -2126,12 +2129,24 @@ async function autoSync() {
       done.add(g.agent);
       for (const r of unsynced(g.agent).filter(r => r.createdAt > state.autoSyncFrom && r.title)) {
         const t = await createTopic(Number(chatId), g.agent, r.cwd, r.cliSessionId, r.title);
-        t.mirrorAt = openTurnAt(transcriptPath(t)) ?? t.mirrorAt; save(); // still mid-turn on the desktop: that turn is mirrored once it ends
+        t.deskTitle = r.title; t.mirrorAt = openTurnAt(transcriptPath(t)) ?? t.mirrorAt; save(); // still mid-turn on the desktop: that turn is mirrored once it ends
         const ex = await loadRecap(t, r.cliSessionId);
         await refreshCard(key(t.chatId, t.threadId)).catch(e => log('card failed', e));
         await sendIntro(t, `🖥 桌面上新开的会话「${t.title}」，已自动同步过来。`, ex, `目录：${r.cwd}\n桌面上接着聊会同步到这里；在这里发消息也能接着做。`);
         log('auto-synced', r.cliSessionId, t.title);
       }
+    }
+    // Renamed on the desktop → the topic follows. Only a change seen here counts (the first sight is just recorded), so a
+    // topic renamed in Telegram keeps its name until the desktop title changes again.
+    const titles = new Map(Object.values(sidebarRows()).flat().map(r => [r.cliSessionId, r.title]));
+    for (const [k, t] of Object.entries(state.topics)) {
+      const d = t.sessionId && !t.deleted && !t.closed && !t.isDispatcher && titles.get(t.sessionId);
+      if (!d || d === t.deskTitle) continue;
+      if (t.deskTitle == null) { t.deskTitle = d; save(); continue; }
+      const taken = new Set(Object.values(state.topics).filter(x => x !== t && x.chatId === t.chatId).map(x => x.title));
+      let name = d.slice(0, 100); for (let n = 2; taken.has(name); n++) name = `${d.slice(0, 95)} #${n}`;
+      const ok = await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => true, e => log('topic rename failed', e.description || e.message));
+      t.deskTitle = d; if (ok) { t.title = name; refreshCardSoon(k, 500); log('topic renamed from desktop', t.sessionId, name); } save();
     }
   } finally { autoSyncing = false; }
 }
