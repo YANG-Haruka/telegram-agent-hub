@@ -298,8 +298,8 @@ async function askButtons(chatId, threadId, html, options, vertical = false, ext
 // disable_notification: false; cards notify. owner: /stop in 上朝 leaves these cards alone.
 const notifyOwner = (text, extra = {}) => { const o = { disable_notification: true, ...extra };
   return (CFG.exchange ? bot.api.sendMessage(Number(CFG.exchange), text, o) : Promise.reject()).catch(() => bot.api.sendMessage(OWNER, text, o)).catch(() => {}); };
-const askOwnerHere = (html, options, extra = {}) => (CFG.exchange ? askButtons(Number(CFG.exchange), undefined, html, options, false, { ...extra, owner: true }) : Promise.reject())
-  .catch(() => askButtons(OWNER, undefined, html, options, false, extra));
+const askOwnerHere = (html, options, extra = {}) => (CFG.exchange ? askButtons(Number(CFG.exchange), undefined, html, options, !!extra.vertical, { ...extra, owner: true }) : Promise.reject())
+  .catch(() => askButtons(OWNER, undefined, html, options, !!extra.vertical, extra));
 // Confirms an incoming update / move bundle. Safe default; config confirmBundles=false accepts bundles from the trusted peer bot automatically.
 const askOwner = (html, options) => CFG.confirmBundles === false ? (audit('auto-accept', unhtml(html).split('\n')[0].slice(0, 80)), Promise.resolve(options[0][1])) : askOwnerHere(html, options);
 const unhtml = h => h.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
@@ -814,19 +814,27 @@ async function refreshCard(k) {
 }
 const cardTimers = new Map();
 const refreshCardSoon = (k, ms = 3000) => { clearTimeout(cardTimers.get(k)); cardTimers.set(k, setTimeout(() => refreshCard(k).catch(e => log('card failed', e)), ms)); };
-// Topic name = status mark + t.title (t.title stays bare: topics are looked up by title). 🟡 working, 🔴 waiting for you
-// (a permission card), 🟢 done; no mark before the first turn. config topicStatus: false turns it off.
+// Topic name = status mark + t.title (t.title stays bare: topics are looked up by title). 🟡 working (here, in the desktop
+// app or a terminal), 🔴 waiting for you (a permission / option card), 🟢 idle. config topicStatus: false turns it off.
 export const STATUS_MARKS = { run: '🟡 ', ask: '🔴 ', done: '🟢 ' };
 export const stripMark = name => { const n = String(name), m = Object.values(STATUS_MARKS).find(x => n.startsWith(x)); return m ? n.slice(m.length) : n; };
 const statusTimers = new Map();
+// Sessions `claude agents` shows mid-turn (desktop app, terminals, background agents); refreshed every 30 s.
+let deskBusy = new Set();
+async function deskStatus() {
+  if (CFG.topicStatus === false || state.paused) return;
+  const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
+  deskBusy = new Set(rows.filter(r => r.status === 'busy' || r.state === 'working').map(r => r.sessionId));
+  for (const k of Object.keys(state.topics)) statusSoon(k, 0);
+}
 function statusSoon(k, ms = 1500) {
   if (CFG.topicStatus === false) return;
   clearTimeout(statusTimers.get(k));
   statusTimers.set(k, setTimeout(async () => {
     const t = state.topics[k], s = live.get(k);
     if (!t || t.isDispatcher || t.deleted || t.closed || !t.threadId) return;
-    const st = s?.waiting ? 'ask' : t.busy ? 'run' : t.status ? 'done' : '';
-    if (st) t.status = st;
+    const st = s?.waiting || t.deskAsk ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : 'done';
+    t.status = st;
     const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
     if (name === (t.shownName ?? t.title)) return;
     await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => { t.shownName = name; save(); }, e => log('topic status failed', e.description || e.message));
@@ -2699,28 +2707,46 @@ const refreshSoon = () => { clearTimeout(panelTimer); panelTimer = setTimeout(re
 // ---------- desktop / terminal permission prompts → phone (Claude Code PermissionRequest HTTP hook) ----------
 // Loopback only, bearer token from .env (HUB_HOOK_TOKEN). Hub-owned sessions are skipped (their prompts already go to topics).
 // No answer within HOOK_WAIT → return no decision, so the normal prompt on the computer takes over.
-const HOOK_WAIT = 280e3;
+const HOOK_WAIT = 86340e3; // the hook's own timeout is 86400 s: the card waits for a tap (or 💻) instead of expiring
 export function hookDecision(v) {
   if (v === 'allow') return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
   if (v === 'deny') return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: '用户在 Telegram 上拒绝了这个操作。' } } };
   return {};
 }
-async function onDesktopPermission(req) {
+// A desktop session's AskUserQuestion (its option card) as buttons, one question at a time; the tapped labels go back as
+// the tool's answers. null: skipped / timed out (the card stays on the computer). ponytail: multiSelect takes one option.
+export async function askQuestions(input, where, ask) {
+  const answers = {};
+  for (const q of input?.questions || []) {
+    const opts = q.options || [];
+    const v = await ask(`🖥 <b>桌面会话在问你</b> · ${esc(where)}\n❓ <b>${esc(q.question)}</b>${q.multiSelect ? '（可以多选，这里先只能选一个）' : ''}\n${opts.map(o => `• <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ''}`).join('\n')}`,
+      [...opts.map((o, i) => [o.label, String(i)]), ['💻 回电脑上答', '']], true);
+    if (v == null || v === '' || !opts[Number(v)]) return null;
+    answers[q.question] = opts[Number(v)].label;
+  }
+  return Object.keys(answers).length ? answers : null;
+}
+async function onDesktopPermission(req, gone) {
   // The hub's own prompts come through canUseTool: skip only while the hub itself runs a turn on this session (a topic's
   // session can be open on the desktop too, and its prompts there must still reach the phone).
   if ([...live].some(([k, s]) => s.busy && state.topics[k]?.sessionId === req.session_id) || state.paused) return {};
   const where = `${path.basename(req.cwd || '') || '?'} · ${String(req.session_id || '').slice(0, 8)}`;
-  const html = `🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, opts = [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny']];
   const tk = Object.keys(state.topics).find(k => state.topics[k].sessionId === req.session_id && !state.topics[k].deleted && !state.topics[k].closed);
-  let timer, wid;
-  const p = tk ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, false, { onId: id => { wid = id; } }) // its topic, else 上朝
-    : askOwnerHere(html, opts, { onId: id => { wid = id; } });
-  const timeout = new Promise(res => { timer = setTimeout(() => {
-    if (wid) finishWait(wid, -1, '⌛ 已超时，请回电脑上处理');
-    res(null);
-  }, HOOK_WAIT); });
-  const v = await Promise.race([p, timeout]);
+  let timer, wid, over = false;
+  const tt = tk && state.topics[tk]; if (tt) { tt.deskAsk = true; statusSoon(tk, 0); } // 🔴 while the card waits
+  const ask = (html, opts, vertical = false) => over ? Promise.resolve(null) : tk // its topic, else 上朝
+    ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, vertical, { onId: id => { wid = id; } })
+    : askOwnerHere(html, opts, { vertical, onId: id => { wid = id; } });
+  const flow = req.tool_name === 'AskUserQuestion' ? askQuestions(req.tool_input, where, ask).then(answers => answers && { answers })
+    : ask(`🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny'], ['💻 回电脑上处理', '']]);
+  const timeout = new Promise(res => {
+    const end = note => { over = true; if (wid) finishWait(wid, -1, note); res(null); };
+    timer = setTimeout(() => end('⌛ 已超时，请回电脑上处理'), HOOK_WAIT);
+    gone?.addEventListener('abort', () => end('💻 已在电脑上处理'), { once: true }); // stopped / answered there: the hook call went away
+  });
+  const v = await Promise.race([flow, timeout]).finally(() => { if (tt) { delete tt.deskAsk; statusSoon(tk, 0); } });
   clearTimeout(timer);
+  if (v?.answers) return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow', updatedInput: { ...req.tool_input, answers: v.answers } } } };
   return hookDecision(v);
 }
 // /clear — wipes chat clutter: deletes the hub's topics in a group and every other message there except the pinned
@@ -2773,7 +2799,7 @@ async function cmdApprovals(chatId, threadId, arg) {
   if (fs.existsSync(f)) fs.copyFileSync(f, `${f}.bak-agent-hub`); // one backup, not a new copy of the bearer token per call
   j.hooks ??= {};
   const rest = (j.hooks.PermissionRequest || []).filter(e => e && !(e.hooks || []).some(h => h.url === url)); // also drops nulls: one null makes Claude Code skip the whole file
-  j.hooks.PermissionRequest = on ? [...rest, { hooks: [{ type: 'http', url, headers: { Authorization: `Bearer ${ENV.HUB_HOOK_TOKEN}` }, timeout: 300 }] }] : rest;
+  j.hooks.PermissionRequest = on ? [...rest, { hooks: [{ type: 'http', url, headers: { Authorization: `Bearer ${ENV.HUB_HOOK_TOKEN}` }, timeout: 86400 }] }] : rest;
   if (!j.hooks.PermissionRequest.length) delete j.hooks.PermissionRequest;
   // Same switch: desktop prompts in a topic's session hear what was said in Telegram meanwhile (onDesktopPrompt).
   const recapUrl = url.replace(/\/permission$/, '/recap');
@@ -2791,10 +2817,11 @@ function startHookServer() {
     if (rq.method !== 'POST' || !route || rq.headers.authorization !== `Bearer ${ENV.HUB_HOOK_TOKEN}`) { rs.writeHead(403).end(); return; }
     let body = '';
     rq.on('data', d => { body += d; if (body.length > 1e6) rq.destroy(); });
+    const ac = new AbortController(); rs.on('close', () => { if (!rs.writableEnded) ac.abort(); }); // the CLI gave up waiting
     rq.on('end', async () => {
       let out = {};
-      try { out = await route(JSON.parse(body)); } catch (e) { log('hook failed', e); }
-      rs.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(out));
+      try { const req = JSON.parse(body); log('hook', rq.url, req.tool_name || '', String(req.session_id || '').slice(0, 8)); out = await route(req, ac.signal); } catch (e) { log('hook failed', e); }
+      if (!ac.signal.aborted) rs.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(out));
     });
   }).on('error', e => { // port taken / reserved (Hyper-V): run without desktop approvals instead of crash-looping
     log('permission hook disabled', e.code || e.message);
@@ -3001,6 +3028,7 @@ if (IS_MAIN) {
   for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
   save();
   setInterval(() => mirrorDesktop().catch(e => log('mirror failed', e)), 20e3);
+  setInterval(() => deskStatus().catch(e => log('desk status failed', e)), 30e3);
   setInterval(() => autoSync().catch(e => log('auto sync failed', e)), 60e3);
   process.on('exit', () => {
     for (const job of outgoing) if (job.left.length) keepUnsent(job);

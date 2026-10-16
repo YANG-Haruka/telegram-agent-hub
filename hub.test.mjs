@@ -464,3 +464,16 @@ test('telegram turns a branch lacks; their recap never shows as the user message
   assert.deepEqual(exchanges([{ type: 'user', message: { content: [{ type: 'text', text: r }, { type: 'text', text: '这是用户布置的任务，直接开始做：真正的问题' }] } }, { type: 'assistant', message: { content: [{ type: 'text', text: '好' }] } }]),
     [{ user: '真正的问题', reply: '好' }]);
 });
+
+import { askQuestions } from './hub.mjs';
+test('a desktop option card becomes buttons; taps become the answers', async () => {
+  const input = { questions: [{ question: '用哪个方案？', options: [{ label: 'A', description: '快' }, { label: 'B' }] }, { question: '现在发吗？', multiSelect: true, options: [{ label: '发' }, { label: '等等' }] }] };
+  const seen = [], taps = ['1', '0'];
+  const ask = (html, opts, vertical) => { seen.push({ html, opts, vertical }); return Promise.resolve(taps.shift()); };
+  assert.deepEqual(await askQuestions(input, 'p · 1234', ask), { '用哪个方案？': 'B', '现在发吗？': '发' });
+  assert.ok(seen[0].vertical && seen[0].html.includes('• <b>A</b> — 快') && seen[0].opts.at(-1)[1] === '');
+  assert.match(seen[1].html, /只能选一个/);
+  assert.equal(await askQuestions(input, 'p', () => Promise.resolve('')), null); // 回电脑上答
+  assert.equal(await askQuestions(input, 'p', () => Promise.resolve(null)), null); // timed out
+  assert.equal(await askQuestions({}, 'p', () => Promise.resolve('0')), null);
+});
