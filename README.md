@@ -26,7 +26,7 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 ## Features
 
 **Chat and files**
-- Two-way chat per project topic. Live progress message, pinned session card (context %, connectors, outputs, model, effort, mode).
+- Two-way chat per project topic (live progress message only with `progressMessage: true`; the topic's status mark shows it), pinned session card (context %, connectors, outputs, model, effort, mode).
 - Agent replies are rendered from Markdown (bold, code blocks with language, links, lists, quotes; tables as monospace). Long replies are split without breaking code blocks; a chunk Telegram rejects is resent as plain text.
 - Phone → agent: photos and albums (collected for 1.5 s into one message), images sent as files (≤ 5 MB, ≤ 8000 px) and PDFs (≤ 10 MB, ≤ 100 pages, Claude only) go to the agent directly; anything else is saved in `inbox/` and passed as a path.
 - Agent → phone: the `send_file` tool and `/get <path>` work for any file on the machine (folders are zipped); the hub's own folder and secret-looking files (`.env`, keys, `auth.json`, dotfiles …) are refused.
@@ -59,7 +59,7 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 
 **Permissions and safety**
 - Risky actions arrive as cards — *allow once* / *allow for this session* / *deny*, with the command or diff shown (secret files masked). Default mode `auto` (only risky actions ask); `/mode ask|auto` per topic or group. No full-bypass mode from Telegram.
-- `/approvals on` routes permission prompts of Claude Desktop / terminal sessions on that machine to buttons in 上朝 (it adds an HTTP hook to `~/.claude/settings.json`; 5 minutes without a tap → handle it at the computer). `/approvals on mac` in 上朝 does it on the Mac.
+- `/approvals on` routes permission prompts of Claude Desktop / terminal sessions on that machine to buttons in that session's topic, or in 上朝 when it has none (it adds an HTTP hook to `~/.claude/settings.json`; 5 minutes without a tap → handle it at the computer). `/approvals on mac` in 上朝 does it on the Mac.
 - `/panic` (private chat, 上朝 or any group): stops every session on the machine (in 上朝: on both), denies pending cards, clears queues and auto-resumes, and keeps the hub paused across restarts — nothing new runs, no peer tasks or bundles are accepted. `/resume_hub` ends it.
 - Signed cross-machine messages (see *Security*), DPAPI-encrypted secrets on Windows, secret redaction, stranger removal, append-only audit log.
 

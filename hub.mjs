@@ -940,7 +940,7 @@ function startSession(k) {
   return s;
 }
 
-// ---------- live progress: one message per long turn, edited in place, deleted when the turn ends ----------
+// ---------- live progress (config progressMessage: true): one message per long turn, edited in place, deleted when it ends ----------
 export function toolSummary(b) {
   const i = b.input || {}, short = (x, n = 50) => String(x ?? '').replace(/\s+/g, ' ').slice(0, n);
   const arg = i.command ?? i.file_path ?? i.notebook_path ?? i.pattern ?? i.url ?? i.query ?? i.description ?? i.prompt ?? '';
@@ -949,7 +949,7 @@ export function toolSummary(b) {
 export const fmtElapsed = ms => { const s = Math.round(ms / 1000); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 function progressSoon(k) {
   const s = live.get(k);
-  if (!s?.busy || s.progTimer) return;
+  if (!s?.busy || s.progTimer || CFG.progressMessage !== true) return; // off by default: the topic's 🟡/🔴/🟢 mark shows it (typing… stays)
   const wait = s.progMsg ? 4000 : Math.max(0, 8000 - (Date.now() - s.turnStart)); // first appears after 8 s, then ≤1 edit / 4 s
   s.progTimer = setTimeout(() => { s.progTimer = null; updateProgress(k).catch(() => {}); }, wait);
 }
@@ -2457,7 +2457,7 @@ const seenUnknown = new Set();
 async function onMessage(ctx) {
   const m = ctx.message, chatId = ctx.chat.id;
   if (m.forum_topic_edited) { // our status renames: drop the service line; the owner's rename: the new bare title
-    if (ctx.from?.id === bot.botInfo?.id) return bot.api.deleteMessage(chatId, m.message_id).catch(() => {});
+    if (ctx.from?.id === bot.botInfo?.id) return bot.api.deleteMessage(chatId, m.message_id).then(() => log('status line deleted', chatId, m.message_thread_id), e => log('status line delete failed', e.description || e.message));
     const t = state.topics[key(chatId, m.message_thread_id)];
     if (t && ctx.from?.id === OWNER && m.forum_topic_edited.name) { t.title = stripMark(m.forum_topic_edited.name); t.shownName = m.forum_topic_edited.name; save(); refreshCardSoon(key(chatId, m.message_thread_id), 500); }
     return;
@@ -2706,10 +2706,15 @@ export function hookDecision(v) {
   return {};
 }
 async function onDesktopPermission(req) {
-  if (hubSessionIds().has(req.session_id) || state.paused) return {};
+  // The hub's own prompts come through canUseTool: skip only while the hub itself runs a turn on this session (a topic's
+  // session can be open on the desktop too, and its prompts there must still reach the phone).
+  if ([...live].some(([k, s]) => s.busy && state.topics[k]?.sessionId === req.session_id) || state.paused) return {};
   const where = `${path.basename(req.cwd || '') || '?'} · ${String(req.session_id || '').slice(0, 8)}`;
+  const html = `🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, opts = [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny']];
+  const tk = Object.keys(state.topics).find(k => state.topics[k].sessionId === req.session_id && !state.topics[k].deleted && !state.topics[k].closed);
   let timer, wid;
-  const p = askOwnerHere(`🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny']], { onId: id => { wid = id; } });
+  const p = tk ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, false, { onId: id => { wid = id; } }) // its topic, else 上朝
+    : askOwnerHere(html, opts, { onId: id => { wid = id; } });
   const timeout = new Promise(res => { timer = setTimeout(() => {
     if (wid) finishWait(wid, -1, '⌛ 已超时，请回电脑上处理');
     res(null);
