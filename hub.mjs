@@ -1108,6 +1108,7 @@ function startTurn(k, content, adopted = false) {
   const t = state.topics[k], s = live.get(k);
   s.busy = true; t.busy = true; t.status = 'run'; statusSoon(k);
   // origin: 'owner' | 'agent:<topic>' (unset = the owner typed here); depth = agent hops behind this task (see send_to_agent)
+  if (!adopted) s.silentNudged = !!content.silentNudge; // a summary turn is never nudged again
   if (content.reportTo || content.replyTo || content.origin) t.turnMeta = { reportTo: content.reportTo, replyTo: content.replyTo, origin: content.origin, depth: content.depth }; else delete t.turnMeta; // survives a restart
   markMirror(t); save();
   clearInterval(s.typing); clearInterval(s.progTick);
@@ -1134,6 +1135,8 @@ async function endTurn(k, err) {
   clearInterval(s.typing); clearInterval(s.progTick); clearTimeout(s.progTimer); s.progTimer = null;
   if (s.progMsg) { bot.api.deleteMessage(t.chatId, s.progMsg).catch(() => {}); s.progMsg = null; }
   const took = Date.now() - (s.turnStart || Date.now());
+  // Worked (tools) but said nothing: one follow-up turn asks for the summary instead of posting an empty answer.
+  const silent = !s.buf.trim() && !err && (s.steps || 0) > 0 && !t.isDispatcher && !s.silentNudged;
   const text = (s.buf.trim() || (err ? '' : '（本轮没有文字回复）')) + (err ? `\n\n${err}` : '') + (took > 60e3 ? `\n\n⏱ 用时 ${fmtElapsed(took)} · ${s.steps} 步` : '');
   // Snapshot this turn before the first await: a message arriving while the answer is sent starts the next turn and overwrites these.
   const turn = { reportTo: s.reportTo, replyTo: s.replyTo, origin: s.origin, depth: s.depth, assigned: s.assigned, nudged: s.nudged, handedOff: s.handedOff, handedTo: s.handedTo, afterTurn: s.afterTurn, limited: s.limited, lastBuf: s.buf.trim() };
@@ -1146,7 +1149,7 @@ async function endTurn(k, err) {
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
   // resumes the transcript); whatever was queued since goes to the fresh session.
   if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
-  await send(t.chatId, t.threadId, t.isCommand ? `🗣 ${text}` : text, { md: true }); // 上朝: a fixed prefix, so the reply can never read as a relay to the peer hub
+  if (!silent) await send(t.chatId, t.threadId, t.isCommand ? `🗣 ${text}` : text, { md: true }); // 上朝: a fixed prefix, so the reply can never read as a relay to the peer hub
   if (!t.isDispatcher) postTurnDiff(k, before, after).catch(e => log('turn diff failed', e.message)).then(() => files.length && sendTurnFiles(k, files)).catch(e => log('auto send failed', e));
   refreshSoon(); refreshCardSoon(k, 500);
   // A task assigned to a 圣旨 must end up in a project topic. If it answered by itself, it gets one firm retry and
@@ -1154,6 +1157,10 @@ async function endTurn(k, err) {
   if (t.isDispatcher && turn.assigned && !turn.handedOff && !turn.nudged && !err) {
     s.queue.unshift(Object.assign([{ type: 'text', text: '你刚才没有把这个任务交给项目话题。规则：派来的任务一律在话题里做。现在就给它起一个简短的英文文件夹名，open_project(path=名字, fresh=true)，再用 handoff 把原任务完整交过去。不要再自己回答，也不要说做不了。' }],
       { reportTo: turn.reportTo, replyTo: turn.replyTo, origin: turn.origin, depth: turn.depth, assigned: true, nudged: true }));
+    turn.reportTo = turn.replyTo = null;
+  }
+  if (silent) { // the summary turn carries this turn's report / result obligations
+    s.queue.unshift(Object.assign([{ type: 'text', text: '（Hub：你这一轮做了事，但没有给用户写任何回复。现在用一两句话告诉用户你刚才做了什么、结果怎样；不要再调用工具。）' }], { reportTo: turn.reportTo, replyTo: turn.replyTo, origin: turn.origin, depth: turn.depth, silentNudge: true }));
     turn.reportTo = turn.replyTo = null;
   }
   // Cut off by the usage limit (and not finished by overage / a fallback): not a result yet. The resumed turn reports instead.
@@ -1597,7 +1604,7 @@ async function createTopic(chatId, agent, cwd, sessionId, wanted) {
 // ---------- recap: show a resumed / copied conversation's memory in Telegram ----------
 // User turns nobody typed (task notifications, slash-command echoes, compaction summaries, the hub's own nudges), and the
 // hub's wrapper lines in front of a task it passed on.
-const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command-message|command-args|local-command-\w+)>|Caveat: |\[Request interrupted|This session is being continued|Hub 刚才重启|刚才额度用完|这是你用 send_to_agent 派出去的任务的结果|你刚才没有把这个任务交给项目话题)/;
+const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command-message|command-args|local-command-\w+)>|Caveat: |\[Request interrupted|This session is being continued|Hub 刚才重启|刚才额度用完|这是你用 send_to_agent 派出去的任务的结果|你刚才没有把这个任务交给项目话题|（Hub：你这一轮做了事)/;
 const HUB_WRAP = /^(（Agent Hub 补充的背景[\s\S]*?（补充背景到此结束）\s*)?(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)?\s*/;
 // The other side's turns, as background (not a request): Telegram ones for the desktop, or for a hub branch that lacks them.
 export const recapText = (ex, intro) => `（Agent Hub 补充的背景，不是新的请求：${intro}，下面这几轮你现在的对话记录里没有，了解一下上下文即可。）\n\n${
