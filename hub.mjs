@@ -2087,21 +2087,57 @@ function readSidebar(dir) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
       else if (/^local_.*\.json$/.test(e.name)) {
-        try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (!j.isArchived && j.cliSessionId && j.cwd) rows.push({ cliSessionId: j.cliSessionId, title: j.title || '', cwd: j.cwd, lastActivityAt: j.lastActivityAt || 0 }); } catch {}
+        try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (!j.isArchived && j.cliSessionId && j.cwd) rows.push({ cliSessionId: j.cliSessionId, title: j.title || '', cwd: j.cwd, lastActivityAt: j.lastActivityAt || 0, createdAt: j.createdAt || 0 }); } catch {}
       }
     }
   };
   try { walk(dir.replace(/^~(?=$|[\\/])/, os.homedir())); } catch {}
   return rows;
 }
-// /sync → pick one from a list; /sync <keyword> → matching titles; /sync all → everything.
-async function cmdSync(chatId, g, arg = '') {
+// An agent's sidebar sessions without a topic (deleted topics count: a session whose topic you deleted stays out).
+function unsynced(agent) {
   const byAgent = {};
   for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) byAgent[a] = readSidebar(c.sidebarDir);
   const have = new Set(Object.values(state.topics).flatMap(t => [t.sessionId, t.forkFrom, t.copyOf]).filter(Boolean)); // copies count: the original has a topic
   // Same refusals as resolveDir (/open): never the hub's own folder (or one containing it), never a workspace root itself.
-  const avail = (partitionSidebar(byAgent)[g.agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
+  return (partitionSidebar(byAgent)[agent] || []).filter(r => !have.has(r.cliSessionId) && fs.existsSync(r.cwd)
     && !inside(HOME, r.cwd) && !inside(r.cwd, HOME) && !rootsAbs().some(x => norm(x) === norm(r.cwd)));
+}
+// Sessions created in the desktop app after state.autoSyncFrom (set on the first run: nothing older is pulled in) get a topic
+// in their account's group by themselves, bound to the session itself (not a copy), so the desktop mirror shows its turns.
+// Waits for the app's auto title. config autoSync: false turns it off.
+let autoSyncing = false;
+// Where a transcript's unfinished turn starts (its end when none is open; null when unreadable). Reads the last 4 MB.
+function openTurnAt(f) {
+  try {
+    const size = fs.statSync(f).size, from = Math.max(0, size - 4 * 1048576), buf = Buffer.alloc(size - from), fd = fs.openSync(f, 'r');
+    try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+    return from + mirrorScan(buf, false).used;
+  } catch { return null; }
+}
+async function autoSync() {
+  if (autoSyncing || state.paused || CFG.autoSync === false) return;
+  if (!state.autoSyncFrom) { state.autoSyncFrom = Date.now(); save(); return; }
+  autoSyncing = true;
+  try {
+    const done = new Set(); // one group per account
+    for (const [chatId, g] of ownGroups()) {
+      if (done.has(g.agent) || !CFG.agents[g.agent]?.sidebarDir) continue;
+      done.add(g.agent);
+      for (const r of unsynced(g.agent).filter(r => r.createdAt > state.autoSyncFrom && r.title)) {
+        const t = await createTopic(Number(chatId), g.agent, r.cwd, r.cliSessionId, r.title);
+        t.mirrorAt = openTurnAt(transcriptPath(t)) ?? t.mirrorAt; save(); // still mid-turn on the desktop: that turn is mirrored once it ends
+        const ex = await loadRecap(t, r.cliSessionId);
+        await refreshCard(key(t.chatId, t.threadId)).catch(e => log('card failed', e));
+        await sendIntro(t, `🖥 桌面上新开的会话「${t.title}」，已自动同步过来。`, ex, `目录：${r.cwd}\n桌面上接着聊会同步到这里；在这里发消息也能接着做。`);
+        log('auto-synced', r.cliSessionId, t.title);
+      }
+    }
+  } finally { autoSyncing = false; }
+}
+// /sync → pick one from a list; /sync <keyword> → matching titles; /sync all → everything.
+async function cmdSync(chatId, g, arg = '') {
+  const avail = unsynced(g.agent);
   if (!avail.length) return send(chatId, undefined, '没有需要同步的会话（侧边栏里的会话都已经有话题了）。');
   const label = r => r.title || path.basename(r.cwd);
   let todo;
@@ -2832,6 +2868,7 @@ if (IS_MAIN) {
   for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
   save();
   setInterval(() => mirrorDesktop().catch(e => log('mirror failed', e)), 20e3);
+  setInterval(() => autoSync().catch(e => log('auto sync failed', e)), 60e3);
   process.on('exit', () => {
     for (const job of outgoing) if (job.left.length) keepUnsent(job);
     try { if (fs.readFileSync(PID, 'utf8') === String(process.pid)) fs.unlinkSync(PID); } catch {}
