@@ -1301,7 +1301,7 @@ function checkUsageAlert(agent, u) {
     staleSince[agent] ??= Date.now();
     if (Date.now() - staleSince[agent] > 2 * 3600e3 && !staleWarned.has(agent)) {
       staleWarned.add(agent); log('usage stale', agent);
-      notifyOwner(`⚠️ ${CFG.agents[agent].label} 的用量已经 2 小时读不到新数据，面板上是旧数字，「用量 ≥90%」提醒暂时不会响。可能是 SDK 更新改了用量接口，看 Hub 日志里的 usage fetch failed。`);
+      log('usage stale 2 h', agent); // the owner can't act on it; the panel shows "as of" anyway
     }
   } else { delete staleSince[agent]; staleWarned.delete(agent); }
   const r = u?.rate_limits, limit = CFG.usageAlert ?? 90;
@@ -3045,7 +3045,7 @@ async function installBundle(pm, doc, byOwner = false) {
       await npmCi().catch(e2 => log('rollback npm ci failed', e2.message));
       return fail(`npm ci：${e.message}`);
     }
-    await notifyOwner(`🔄 ${CFG.machine} Hub 已从置顶安装包更新，空闲时自动重启生效。`);
+    log('bundle installed, restart when idle'); // success is no news: 「待你处理」 only gets what needs the owner
     return restartWhenIdle('self-update');
 }
 // Restarts (exit → Task Scheduler / launchd starts us again) only once no turn is running, queued or waiting for a tap and no
@@ -3087,7 +3087,7 @@ async function dailyUpdate() {
   if (out.startsWith('rolled-back')) return notifyOwner(`⚠️ ${CFG.machine} Hub 自动更新失败，已退回原版本：${out}`);
   if (out.startsWith('rollback-failed')) return notifyOwner(`⚠️ ${CFG.machine} Hub 自动更新失败，退回原版本也没成功（下次重启会用现在装着的版本）：${out}`);
   if (!out.startsWith('updated')) return;
-  await notifyOwner(`🔄 ${CFG.machine} Hub 的 Claude 已自动更新（${out.replace('updated ', '')}），没有任务在跑时会自动重启生效。`);
+  log('claude sdk updated', out); // no notice: nothing for the owner to do
   // The other machine follows with the same SDK: push it the new package-lock.json in a signed bundle (if this hub has a push script).
   const push = path.join(HOME, 'mac', 'push-mac-update.mjs');
   if (fs.existsSync(push)) execFile(process.execPath, [push], { cwd: HOME, windowsHide: true, timeout: 300000 }, (e, so) => log('pushed SDK update to the peer:', String(so || e?.message || '').trim().split('\n').pop()));
