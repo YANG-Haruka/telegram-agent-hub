@@ -283,6 +283,7 @@ export const waits = new Map(); // id -> { resolve, chatId, threadId, msgId, opt
 // extra.onId(id) runs once the wait exists; extra.choice marks an agent's ask_choice (a newer user message cancels it).
 async function askButtons(chatId, threadId, html, options, vertical = false, extra = {}) {
   const id = crypto.randomBytes(6).toString('base64url');
+  html = redact(html); // cards quote commands / file contents: a token inline in a command must not reach the chat either
   const btns = options.map(([label], i) => ({ text: label.slice(0, 60), callback_data: `b:${id}:${i}` }));
   const o = { message_thread_id: threadId, reply_markup: { inline_keyboard: vertical ? btns.map(b => [b]) : [btns] } };
   let plain = false; // too long or unparsable HTML: fall back to plain text instead of losing the card
