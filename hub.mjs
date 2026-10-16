@@ -2693,6 +2693,10 @@ async function onMessage(ctx) {
     return;
   }
   if (ctx.from?.id !== OWNER) return;
+  { // an "其他" answer being typed here: this message is the answer, not a task
+    const fk = `${chatId}:${m.message_thread_id ?? ''}`, r = freeText.get(fk);
+    if (r && m.text && !m.text.startsWith('/')) { freeText.delete(fk); r(m.text); return; }
+  }
   // Closing a topic in Telegram stops its session (frees memory); reopening it marks it open again.
   if (m.forum_topic_closed && m.message_thread_id) return topicGone(chatId, m.message_thread_id, false);
   if (m.forum_topic_reopened && m.message_thread_id) { const t = state.topics[key(chatId, m.message_thread_id)]; if (t) { t.closed = false; save(); } return; }
@@ -2928,17 +2932,23 @@ export function hookDecision(v) {
 }
 // A desktop session's AskUserQuestion (its option card) as buttons, one question at a time; the tapped labels go back as
 // the tool's answers. null: skipped / timed out (the card stays on the computer). ponytail: multiSelect takes one option.
-export async function askQuestions(input, where, ask) {
-  const answers = {};
+// "✏️ 其他": like the desktop card's own "Other", the owner types the answer; other() waits for that text (null = gave up).
+// typed(): text the owner sends there while the card is open (no tap needed); it wins the race, onTyped closes the card.
+export async function askQuestions(input, where, ask, other = async () => null, typed = null, onTyped = () => {}) {
+  const answers = {}, never = new Promise(() => {});
   for (const q of input?.questions || []) {
     const opts = q.options || [];
-    const v = await ask(`🖥 <b>桌面会话在问你</b> · ${esc(where)}\n❓ <b>${esc(q.question)}</b>${q.multiSelect ? '（可以多选，这里先只能选一个）' : ''}\n${opts.map(o => `• <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ''}`).join('\n')}`,
-      [...opts.map((o, i) => [o.label, String(i)]), ['💻 回电脑上答', '']], true);
+    const v = await Promise.race([ask(`🖥 <b>桌面会话在问你</b> · ${esc(where)}\n❓ <b>${esc(q.question)}</b>${q.multiSelect ? '（可以多选，这里先只能选一个）' : ''}\n${opts.map(o => `• <b>${esc(o.label)}</b>${o.description ? ` — ${esc(o.description)}` : ''}`).join('\n')}${typed ? '\n<i>也可以直接在这里打字回答。</i>' : ''}`,
+      [...opts.map((o, i) => [o.label, String(i)]), ['✏️ 其他（自己输入）', 'other'], ['💻 回电脑上答', '']], true), typed ? typed().then(t => (t ? { typed: t } : never)) : never]);
+    if (v?.typed) { onTyped(v.typed); answers[q.question] = v.typed; continue; }
+    if (v === 'other') { const txt = await other(q.question); if (!txt) return null; answers[q.question] = txt; continue; }
     if (v == null || v === '' || !opts[Number(v)]) return null;
     answers[q.question] = opts[Number(v)].label;
   }
   return Object.keys(answers).length ? answers : null;
 }
+const freeText = new Map(); // "chatId:threadId" → resolve(text): an "其他" answer being typed there
+const waitFreeText = (chatId, threadId) => new Promise(res => { freeText.get(`${chatId}:${threadId ?? ''}`)?.(null); freeText.set(`${chatId}:${threadId ?? ''}`, res); });
 async function onDesktopPermission(req, gone) {
   // The hub's own prompts come through canUseTool: skip only while the hub itself runs a turn on this session (a topic's
   // session can be open on the desktop too, and its prompts there must still reach the phone).
@@ -2950,14 +2960,20 @@ async function onDesktopPermission(req, gone) {
   const ask = (html, opts, vertical = false) => over ? Promise.resolve(null) : tk // its topic, else 上朝
     ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, vertical, { onId: id => { wid = id; } })
     : askOwnerHere(html, opts, { vertical, onId: id => { wid = id; } });
-  const flow = req.tool_name === 'AskUserQuestion' ? askQuestions(req.tool_input, where, ask).then(answers => answers && { answers })
+  const [ch, th] = tk ? [state.topics[tk].chatId, state.topics[tk].threadId] : [Number(CFG.exchange), exThread('todo')];
+  const other = async question => { if (over) return null; await send(ch, th, `✏️ 请输入「${question}」的答案（这句不会当成新任务）：`, { reply_markup: { force_reply: true, input_field_placeholder: '输入你的答案…' } }); return waitFreeText(ch, th); };
+  const typed = () => over ? Promise.resolve(null) : waitFreeText(ch, th), onTyped = txt => wid && finishWait(wid, -1, `✏️ 你的回答：${txt.slice(0, 200)}`);
+  const flow = req.tool_name === 'AskUserQuestion' ? askQuestions(req.tool_input, where, ask, other, typed, onTyped).then(answers => answers && { answers })
     : ask(`🖥 <b>桌面会话请求权限</b> · ${esc(where)}\n🔐 <b>${esc(req.tool_name)}</b>\n${renderTool(req.tool_name, req.tool_input || {})}`, [['✅ 允许一次', 'allow'], ['❌ 拒绝', 'deny'], ['💻 回电脑上处理', '']]);
   const timeout = new Promise(res => {
-    const end = note => { over = true; if (wid) finishWait(wid, -1, note); res(null); };
+    const end = note => { over = true; if (wid) finishWait(wid, -1, note); freeText.get(`${ch}:${th ?? ''}`)?.(null); freeText.delete(`${ch}:${th ?? ''}`); res(null); };
     timer = setTimeout(() => end('⌛ 已超时，请回电脑上处理'), HOOK_WAIT);
     gone?.addEventListener('abort', () => end('💻 已在电脑上处理'), { once: true }); // stopped / answered there: the hook call went away
   });
-  const v = await Promise.race([flow, timeout]).finally(() => { if (tt) { delete tt.deskAsk; statusSoon(tk, 0); } });
+  const v = await Promise.race([flow, timeout]).finally(() => {
+    if (tt) { delete tt.deskAsk; statusSoon(tk, 0); }
+    const fk = `${ch}:${th ?? ''}`; freeText.get(fk)?.(null); freeText.delete(fk); // answered by a tap: the next message there is a message again
+  });
   clearTimeout(timer);
   if (v?.answers) return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow', updatedInput: { ...req.tool_input, answers: v.answers } } } };
   return hookDecision(v);

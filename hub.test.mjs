@@ -532,3 +532,20 @@ test('desktop mirror carries the files the session sent the owner', () => {
   assert.deepEqual(r.ex, [{ user: '对比一下', reply: '发了' }]);
   assert.deepEqual(r.files, [{ paths: ['a.jpg', 'b.jpg'], caption: '对比图' }]);
 });
+
+test('desktop option card: "其他" takes a typed answer', async () => {
+  const input = { questions: [{ question: '用哪个方案？', options: [{ label: 'A' }, { label: 'B' }] }] };
+  let opts;
+  const ask = (html, o) => { opts = o; return Promise.resolve('other'); };
+  assert.deepEqual(await askQuestions(input, 'p', ask, async q => `先试 C（${q}）`), { '用哪个方案？': '先试 C（用哪个方案？）' });
+  assert.deepEqual(opts.map(o => o[1]), ['0', '1', 'other', '']);
+  assert.equal(await askQuestions(input, 'p', ask, async () => null), null); // gave up / timed out
+});
+test('desktop option card: text typed while the card is open is the answer', async () => {
+  const input = { questions: [{ question: 'Q1', options: [{ label: 'A' }] }, { question: 'Q2', options: [{ label: 'B' }] }] };
+  const closed = [];
+  const ask = (html, o) => html.includes('Q2') ? Promise.resolve('0') : new Promise(() => {}); // Q1: no tap, typed instead
+  let n = 0; const typed = () => (n++ === 0 ? Promise.resolve('我自己写的') : new Promise(() => {}));
+  assert.deepEqual(await askQuestions(input, 'p', ask, async () => null, typed, t => closed.push(t)), { Q1: '我自己写的', Q2: 'B' });
+  assert.deepEqual(closed, ['我自己写的']);
+});
