@@ -446,8 +446,8 @@ test("takeover only touches CLI processes the Claude desktop app started", () =>
 
 import { STATUS_MARKS, stripMark } from './hub.mjs';
 test('topic status marks come off a renamed title', () => {
-  for (const m of Object.values(STATUS_MARKS)) assert.equal(stripMark(m + 'LinguaHaru'), 'LinguaHaru');
-  assert.equal(stripMark('LinguaHaru'), 'LinguaHaru');
+  for (const m of Object.values(STATUS_MARKS)) assert.equal(stripMark(m + 'my-project'), 'my-project');
+  assert.equal(stripMark('my-project'), 'my-project');
   assert.equal(stripMark('🟡 🟢 x'), '🟢 x'); // one mark only: a title may itself start with an emoji
 });
 
