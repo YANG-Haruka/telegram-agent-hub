@@ -766,7 +766,7 @@ export const EFFORTS = [['默认', 'default'], ['Low', 'low'], ['Medium', 'mediu
 const isCodex = t => CFG.agents[t?.agent]?.type === 'codex' && !t?.isDispatcher;
 export const effortOf = t => (t?.isDispatcher ? CFG.dispatcherEffort || 'low' : t?.effort || (isCodex(t) ? CFG.codexEffort || 'xhigh' : CFG.projectEffort)) || undefined;
 const codexTier = t => CFG.codexServiceTier === 'default' ? 'default' : t.tierActual; // undefined until the thread has started
-const effortLine = t => `🎚 Effort: ${effortOf(t) || '模型默认'}${t.effort ? '（你设的）' : ''}${isCodex(t) && codexTier(t) !== undefined ? ` · ${/^(priority|fast)$/.test(codexTier(t)) ? 'Fast' : '标准速度'}` : ''}`;
+const effortLine = t => `🎚 Effort: ${effortOf(t) || '模型默认'}${t.ultracode && !isCodex(t) ? ' + Ultra' : ''}${t.effort ? '（你设的）' : ''}${isCodex(t) && codexTier(t) !== undefined ? ` · ${/^(priority|fast)$/.test(codexTier(t)) ? 'Fast' : '标准速度'}` : ''}`;
 
 // The pinned session card (the owner's pick): folder, context, the account's 5-hour and weekly limits, model, effort, mode.
 // info.limits: lines from claudeLimits / codexLimits (cached usage; refreshed with the usage panels).
@@ -1115,7 +1115,8 @@ function startTurn(k, content, adopted = false) {
   // /effort changed since the last turn (Claude only; Codex sends it with every turn): apply first, then send. null = model default.
   // The git snapshot too: the agent must not touch files before the "before" tree is taken.
   const e = effortOf(t);
-  const effortSet = s.q.applyFlagSettings && s.effort !== e ? (s.effort = e, s.q.applyFlagSettings({ effortLevel: e ?? null }).catch(err => log('effort failed', err))) : null;
+  const u = !!t.ultracode && !isCodex(t);
+  const effortSet = s.q.applyFlagSettings && (s.effort !== e || !!s.ultra !== u) ? (s.effort = e, s.ultra = u, s.q.applyFlagSettings({ effortLevel: e ?? null, ultracode: u }).catch(err => log('effort failed', err))) : null;
   s.before = snapTree(s, t);
   s.pushed = Promise.all([effortSet, s.before]).finally(() => s.push(msg)); // Codex: settles once turn/start returned (turnId known)
 }
@@ -2531,12 +2532,14 @@ async function cmdModel(chatId, threadId, k, arg) {
 async function cmdEffort(chatId, threadId, k, arg) {
   const t = k && state.topics[k];
   if (!t || t.isDispatcher) return send(chatId, threadId, '请到具体的项目话题里用 /effort。');
-  let v = EFFORTS.find(([l, x]) => x === arg.toLowerCase() || l.toLowerCase() === arg.toLowerCase())?.[1];
-  if (!v) v = await askButtons(chatId, threadId, `话题「${esc(t.title)}」当前 effort：<b>${esc(effortOf(t) || '模型默认')}</b>\n选择新档位（下一轮起生效）：`, EFFORTS, true);
+  const opts = isCodex(t) ? EFFORTS : [...EFFORTS, ['Ultra（Ultracode：大任务自动拆给多个子 agent 并行，很费额度）', 'ultra']];
+  let v = opts.find(([l, x]) => x === arg.toLowerCase() || l.toLowerCase() === arg.toLowerCase())?.[1];
+  if (!v) v = await askButtons(chatId, threadId, `话题「${esc(t.title)}」当前 effort：<b>${esc(effortOf(t) || '模型默认')}${t.ultracode ? ' + Ultra' : ''}</b>\n选择新档位（下一轮起生效）：`, opts, true);
   if (!v) return;
-  if (v === 'default') delete t.effort; else t.effort = v;
+  if (v === 'ultra') t.ultracode = true;
+  else { delete t.ultracode; if (v === 'default') delete t.effort; else t.effort = v; }
   save(); refreshCardSoon(k, 500);
-  return send(chatId, threadId, `✅ 话题「${t.title}」下一轮起用 ${effortOf(t) || '模型默认'}`);
+  return send(chatId, threadId, `✅ 话题「${t.title}」下一轮起用 ${effortOf(t) || '模型默认'}${t.ultracode ? ' + Ultra（Ultracode）' : ''}`);
 }
 
 // ---------- inbound messages ----------
@@ -2661,6 +2664,7 @@ bot.on('message', ctx => { onMessage(ctx).catch(e => log('message handler failed
 const seenUnknown = new Set();
 async function onMessage(ctx) {
   const m = ctx.message, chatId = ctx.chat.id;
+  if (m.new_chat_photo && ctx.from?.is_bot && (ctx.from.id === bot.botInfo?.id || isPeerBot(ctx.from))) return bot.api.deleteMessage(chatId, m.message_id).catch(() => {}); // avatar swaps: no "changed the photo" line
   if (m.forum_topic_edited) { // our status renames: keep only the newest service line; the owner's rename: the new bare title
     if (ctx.from?.id === bot.botInfo?.id) {
       // Clients apply a topic's new name from this line: deleting it at once left them showing the old status. So the
@@ -3094,6 +3098,24 @@ export const peerAgeMin = (desc, now = Date.now(), machine) => {
 };
 // Proactive "peer offline / back online" notices are opt-in (config peerAlerts: true): a sleeping laptop needs no action, and a
 // task sent to an offline machine already gets "🏖 … 今天请假了" on the spot.
+// Group photos (avatars/<name>-awake.png / -asleep.png): a hub keeps its own groups (config groups[id].avatar) on the awake
+// picture, and switches the other machine's groups (config peerAvatars: { chatId: { machine, avatar } }) to the asleep one
+// while that machine's heartbeat is stale — a machine that is down can't change its own. Needs the bot as an admin (change
+// info) in the other machine's groups; without it the failure is logged once.
+const photoFailed = new Set();
+async function setGroupPhoto(chatId, name, mode) {
+  const f = path.join(HOME, 'avatars', `${name}-${mode}.png`), k = String(chatId);
+  if (!fs.existsSync(f) || (state.photos ??= {})[k] === mode) return;
+  const ok = await bot.api.setChatPhoto(Number(chatId), new InputFile(f)).then(() => true, e => { if (!photoFailed.has(k)) { photoFailed.add(k); log('group photo failed', k, e.description || e.message); } return false; });
+  if (ok) { state.photos[k] = mode; save(); }
+}
+export async function syncGroupPhotos(atStart = false) {
+  for (const [id, g] of ownGroups()) if (g.avatar) { if (atStart) delete state.photos?.[id]; await setGroupPhoto(id, g.avatar, 'awake'); } // back up: whatever the other hub set
+  for (const [id, p] of Object.entries(CFG.peerAvatars || {})) {
+    const age = await peerAge(p.machine);
+    if (Number.isFinite(age)) await setGroupPhoto(id, p.avatar, age > PEER_OFFLINE_MIN ? 'asleep' : 'awake');
+  }
+}
 async function watchPeers() {
   if (!CFG.peerAlerts) return;
   for (const w of CFG.watch || []) {
@@ -3110,7 +3132,7 @@ async function watchPeers() {
 
 // ---------- self-update from a bundle the Windows hub posts in 上朝 (config selfUpdate=true, i.e. the Mac) ----------
 const BUNDLE_FILES = ['hub.mjs', 'package.json', 'package-lock.json', 'config.json'];
-const BUNDLE_EXTRA = ['desktop-approve.js']; // installed when the bundle carries them (older bundles don't)
+const BUNDLE_EXTRA = ['desktop-approve.js', ...['mac', 'mywin', 'idwin'].flatMap(n => [`avatars/${n}-awake.png`, `avatars/${n}-asleep.png`])]; // installed when the bundle carries them (older bundles don't)
 async function receiveBundle(m, doc) {
   if (doc.file_unique_id === state.lastBundle || m.date <= (state.lastBundleAt || 0)) return; // already installed, or older than it
   const v = await askOwner(`🔄 收到 ${esc(CFG.machine)} Hub 更新包：${esc(m.caption || doc.file_name)}（${Math.round((doc.file_size || 0) / 1024)} KB）。安装吗？`, [['✅ 安装', 'y'], ['❌ 不装', 'n']]);
@@ -3149,7 +3171,7 @@ async function installBundle(pm, doc, byOwner = false) {
     const npmCi = () => execFileP('npm', ['ci', '--no-audit', '--no-fund'], { cwd: HOME, timeout: 600000, shell: process.platform === 'win32' });
     state.verifyUpdate = true; state.updateBoots = 0; save(); // before the copy: a crash halfway still boots under the rollback guard
     for (const f of BUNDLE_FILES) fs.copyFileSync(path.join(dir, f), path.join(HOME, f)); // .env, state.json, logins untouched
-    for (const f of BUNDLE_EXTRA) if (fs.existsSync(path.join(dir, f))) fs.copyFileSync(path.join(dir, f), path.join(HOME, f));
+    for (const f of BUNDLE_EXTRA) if (fs.existsSync(path.join(dir, f))) { fs.mkdirSync(path.dirname(path.join(HOME, f)), { recursive: true }); fs.copyFileSync(path.join(dir, f), path.join(HOME, f)); }
     rmTemp();
     if (!lockSame) try { await npmCi(); } catch (e) { // roll back to prev/ (files and dependencies)
       for (const f of BUNDLE_FILES) fs.copyFileSync(path.join(prev, f), path.join(HOME, f));
@@ -3252,7 +3274,7 @@ if (IS_MAIN) {
   if (process.platform === 'darwin' && CFG.keepAwake !== false) childProcess.spawn('caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore' }).on('error', () => {});
   process.on('unhandledRejection', e => log('unhandledRejection', e));
   startHookServer();
-  setInterval(() => { heartbeat().then(watchPeers).catch(e => log('health failed', e)); announceUnpaired(); }, 5 * 60e3);
+  setInterval(() => { heartbeat().then(watchPeers).then(() => syncGroupPhotos()).catch(e => log('health failed', e)); announceUnpaired(); }, 5 * 60e3);
   setInterval(resumeDueTopics, 60e3);
   let restartAsked = false;
   setInterval(() => { if (!restartAsked && fs.existsSync(RESTART_FLAG)) { restartAsked = true; fs.rmSync(RESTART_FLAG, { force: true }); restartWhenIdle('requested'); } }, 10e3);
@@ -3277,6 +3299,7 @@ if (IS_MAIN) {
     if (started) return log('poller restarted');
     started = true;
     log(`hub started as @${me.username} v${HUB_VERSION}`);
+    syncGroupPhotos(true).catch(e => log('group photos failed', e.message));
     loadTopicIcon().then(async () => { if (!topicIconId) return; for (const t of Object.values(state.topics)) if (!t.deleted && !t.isDispatcher && t.threadId && t.iconId !== topicIconId && ownGroups().some(([id]) => id === String(t.chatId)))
       await bot.api.editForumTopic(t.chatId, t.threadId, { icon_custom_emoji_id: topicIconId }).then(() => { t.iconId = topicIconId; save(); }, e => /NOT_MODIFIED/.test(e.description || '') ? (t.iconId = topicIconId, save()) : log('topic icon failed', e.description || e.message)); }).catch(e => log('topic icon failed', e.message)); refreshPanels(); heartbeat().then(() => setTimeout(watchPeers, 60e3)); dailyChecks(); announceUnpaired();
     if (state.paused) notifyOwner(`${pausedNote()}（Hub 刚重启过，仍在暂停中）`, { disable_notification: false });

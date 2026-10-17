@@ -41,7 +41,7 @@ Hub 给你的提醒和确认卡片（批准、用量、登录、更新、配对�
 
 - 调度员（圣旨、上朝）：Sonnet + 低思考强度（config `dispatcherModel` / `dispatcherEffort`），只做分派。只给白名单工具：圣旨 = 找目录（Glob）+ Hub 自己的工具，上朝 = 只能派活；不加载你的用户设置、插件和其它 MCP。
 - 项目话题：账号默认模型；`/model` 按话题或按群改。Codex 的模型取自它自己的 config.toml，`/model` 在 Codex 群和话题里只回「暂不支持」。更新自检用 Haiku。
-- 思考强度（effort）：`/effort` 按话题改（默认 / Low / Medium / High / XHigh / Max），下一轮起生效，重启后还在，卡片上有 Effort 一行。没设时：Claude 用模型默认（config `projectEffort` 可统一指定）；Codex 每轮用 xhigh（config `codexEffort`），速度档沿用 Codex 的 config.toml，config `codexServiceTier: "default"` 改为标准速度。
+- 思考强度（effort）：`/effort`（Claude 话题还有「Ultra」：在当前档位上打开 Ultracode，大任务自动拆给多个子 agent 并行，很费额度；再选别的档位就关掉） 按话题改（默认 / Low / Medium / High / XHigh / Max），下一轮起生效，重启后还在，卡片上有 Effort 一行。没设时：Claude 用模型默认（config `projectEffort` 可统一指定）；Codex 每轮用 xhigh（config `codexEffort`），速度档沿用 Codex 的 config.toml，config `codexServiceTier: "default"` 改为标准速度。
 - 用量 ≥ 90%（config `usageAlert`）：在上朝提醒并一键把该账号的会话切到另一个账号（`/account` 手动切；记忆不变）。
 - 做到一半额度用完：话题里弹「切到另一个号马上继续 / 等重置后自动继续 / 先不管」；不选就到重置时间自动接着做（Codex 话题暂不支持）。
 - Claude 用量每 15 分钟查一次（接口会限流）；查不到显示上次数据并标 `as of`；连续 2 小时查不到在上朝提醒一次（这期间 90% 提醒不会响）。Codex 用量同样 15 分钟查一次。
