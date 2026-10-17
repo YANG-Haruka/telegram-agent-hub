@@ -30,7 +30,7 @@ One hub process and one bot per computer. One Telegram forum group per agent acc
 - Agent replies are rendered from Markdown (bold, code blocks with language, links, lists, quotes; tables as monospace). Long replies are split without breaking code blocks; a chunk Telegram rejects is resent as plain text.
 - Phone → agent: photos and albums (collected for 1.5 s into one message), images sent as files (≤ 5 MB, ≤ 8000 px) and PDFs (≤ 10 MB, ≤ 100 pages, Claude only) go to the agent directly; anything else is saved in `inbox/` and passed as a path.
 - Agent → phone: the `send_file` tool and `/get <path>` work for any file on the machine (folders are zipped); the hub's own folder and secret-looking files (`.env`, keys, `auth.json`, dotfiles …) are refused.
-- Automatic file sync: after each turn, the files the agent itself wrote or edited with its tools (not what tests, builds or scripts left on disk; it sends those with send_file when they matter) (images, PDF, Office, csv, media, html, zip, txt, md) are sent to the topic — up to 3 directly, the rest behind buttons. `autoSendFiles: false` turns it off.
+- Automatic file sync (off by default, `autoSendFiles: true` turns it on; otherwise ask the agent and it uses send_file): after each turn, the files the agent itself wrote or edited with its tools (not what tests, builds or scripts left on disk; it sends those with send_file when they matter) (images, PDF, Office, csv, media, html, zip, txt, md) are sent to the topic — up to 3 directly, the rest behind buttons. `autoSendFiles: false` turns it off.
 - Per-turn change summary for git projects (「📝 N files +a −b」, via a temporary index — your staging area is never touched); `/diff` sends the full diff of the last turn, secret files masked.
 - Steering: a message sent while the agent is working goes straight into the running turn (Claude: `priority: 'next'`, read after the current step; Codex: `turn/steer`) — 「💬 已插话」 instead of queuing. `/stop` still interrupts at once; hub-fed work (handoffs, relays) still queues.
 - Memory takeover: if a project's latest session is open in the desktop app, the topic continues from a copy with the full memory (marked ⑂) instead of asking; an existing topic whose session is open on the desktop offers 「📋 复制一份在这里继续」. Topics started from an existing conversation show 「📜 之前的对话」 (the last few exchanges, collapsed); `/history [n]` sends up to 50 as a Markdown file.
@@ -138,7 +138,7 @@ UI text is Chinese (pinned panels are English). Contributions for other language
 | `selfUpdate` | accept update bundles from the other machine |
 | `confirmBundles` | default: you tap to accept each update / move bundle; `false` = accept automatically from `peerBots` (a changed pairing key always needs your tap) |
 | `handoffPerHour` | agent-initiated sends per topic per hour (default 10, 0 = no limit) |
-| `autoSendFiles` | `false` = don't send a turn's new files automatically |
+| `autoSendFiles` | `true` = send the files a turn wrote automatically (default off) |
 | `dispatcherModel`, `dispatcherEffort` | dispatcher model / effort (default `sonnet` / `low`) |
 | `projectEffort` | effort for Claude topics without `/effort` (default: the model's own) |
 | `codexEffort`, `codexServiceTier` | Codex effort per turn (default `xhigh`); `codexServiceTier: "default"` = standard speed instead of the tier in Codex's `config.toml` |
