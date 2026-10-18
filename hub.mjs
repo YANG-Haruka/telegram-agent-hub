@@ -1222,18 +1222,18 @@ function desktopTakeover(k) {
   if (!takeovers.has(k)) takeovers.set(k, (async () => {
     const t = state.topics[k], wait = ms => new Promise(r => setTimeout(r, ms));
     if (!t.sessionId || isCodex(t)) return false;
-    let told = false;
-    for (const end = Date.now() + 6 * 3600e3; Date.now() < end; await wait(10e3)) {
+    // A desktop that stays busy (a long background task / workflow) once held messages here for hours: wait a minute at
+    // most, then go on anyway (the two branches are bridged by the recaps). No notice either way.
+    let seen = false;
+    for (const end = Date.now() + 60e3; ; await wait(10e3)) {
       const r = await desktopProc(t.sessionId);
-      if (!r) return told; // closed there meanwhile
-      if (r.status !== 'idle') {
-        if (!told) { told = true; await send(t.chatId, t.threadId, '⏳ 桌面上这个会话正在跑，等这一轮做完就接管过来，接着处理你的消息。'); }
-        continue;
-      }
+      if (!r) return seen; // not (or no longer) open in the app
+      seen = true;
+      if (r.status !== 'idle' && Date.now() < end) continue;
+      if (r.status !== 'idle') log('desktop still busy after 1 min, going on anyway', t.sessionId);
       log('took over from the desktop app', t.sessionId); audit('takeover', t.chatId, t.threadId);
       return true;
     }
-    return false;
   })().finally(() => takeovers.delete(k)));
   return takeovers.get(k);
 }
@@ -2677,7 +2677,7 @@ async function topicTurn(ctx, k, msgs) {
   // Owner messages steer the running turn instead of waiting behind it (hub-fed work — feed, handoffs, results — still queues).
   if (s.busy && !s.closeAfter && await s.steer(content)) {
     audit('steer', t.chatId, t.threadId ?? '-', s.codex ? 'codex' : 'claude');
-    return send(t.chatId, t.threadId, '💬 已插话：做完手头这一步就会看到（要立刻打断发 /stop）');
+    return; // silent: a message sent mid-turn is taken in by default
   }
   s = live.get(k) || startSession(k); // Codex steer failed (turn just ended) or the session closed meanwhile
   if (s.busy || s.queue.length) { s.queue.push(content); return send(t.chatId, t.threadId, `⏳ 已排队（${s.queue.length} 条），/stop 可清空`); }
@@ -2716,7 +2716,7 @@ async function onMessage(ctx) {
   // Another hub's bot in 上朝: only the bots listed in config "peerBots" (username or id) are trusted — anything they send
   // can run tasks or install code here, so an unknown bot added to the group is ignored (fail closed).
   if (CFG.commandGroups?.[String(chatId)] && ctx.from?.is_bot && ctx.from.id !== bot.botInfo?.id) {
-    if (isPeerBot(ctx.from)) return onPeerMessage(m);
+    if (isPeerBot(ctx.from)) { if (state.peerBotId !== ctx.from.id) { state.peerBotId = ctx.from.id; save(); } return onPeerMessage(m); }
     if (!seenUnknown.has(ctx.from.id)) { seenUnknown.add(ctx.from.id); log('ignored untrusted bot in 上朝', ctx.from.username, ctx.from.id); }
     return;
   }
@@ -2777,10 +2777,13 @@ async function onMessage(ctx) {
     return onTopicMessage(ctx, ck);
   }
   const g = CFG.groups[String(chatId)];
-  if (!g && !CFG.commandGroups?.[String(chatId)] && !seenUnknown.has(chatId)) { // a group we were added to but don't know yet
+  if (!g && !CFG.commandGroups?.[String(chatId)] && !seenUnknown.has(chatId) && !(state.unknownNoted || []).includes(chatId)) { // a group we were added to but don't know yet
     seenUnknown.add(chatId);
-    log('unknown group', chatId, ctx.chat.title);
-    notifyOwner(`👋 ${CFG.machine} 的 bot 在一个还没配置的群里收到了消息：「${ctx.chat.title}」（id ${chatId}）。`);
+    // The other hub's group (its bot is in it: added there for the offline avatars) is not news; any other group once.
+    const peerHere = state.peerBotId && await bot.api.getChatMember(chatId, state.peerBotId).then(x => !['left', 'kicked'].includes(x.status), () => false);
+    (state.unknownNoted ??= []).push(chatId); save();
+    log('unknown group', chatId, ctx.chat.title, peerHere ? '(the other hub\'s)' : '');
+    if (!peerHere) notifyOwner(`👋 ${CFG.machine} 的 bot 在一个还没配置的群里收到了消息：「${ctx.chat.title}」（id ${chatId}）。`);
   }
   if (!g || g.owner === 'mac-hub') return;
   if (m.date < Date.now() / 1000 - STALE_SEC) return send(chatId, m.message_thread_id, `这条消息是 ${Math.round((Date.now() / 1000 - m.date) / 60)} 分钟前发的，Hub 当时不在线。需要的话请重发。`);
