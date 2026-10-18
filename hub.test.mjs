@@ -551,3 +551,12 @@ test('desktop option card: text typed while the card is open is the answer', asy
   assert.deepEqual(await askQuestions(input, 'p', ask, async () => null, typed, t => closed.push(t)), { Q1: '我自己写的', Q2: 'B' });
   assert.deepEqual(closed, ['我自己写的']);
 });
+
+test('desktop quick replies (wrap_up actions) ride along with the mirrored answer', () => {
+  const L = o => JSON.stringify(o) + '\n';
+  const wrap = { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '查完了', ask: '按两批重训？', actions: [{ label: '两批都训', message: '8 个按两批重训。' }, { label: '只训第一批', message: '先训第一批。' }, { label: 'x' }] } };
+  const buf = Buffer.from([L({ type: 'user', message: { content: '查一下' } }), L({ type: 'assistant', message: { content: [wrap] } }), L({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'w', content: '' }] } })].join(''));
+  const r = mirrorScan(buf, true);
+  assert.equal(r.ex[0].reply, '查完了\n按两批重训？');
+  assert.deepEqual(r.ex[0].actions, [{ label: '两批都训', message: '8 个按两批重训。' }, { label: '只训第一批', message: '先训第一批。' }]);
+});

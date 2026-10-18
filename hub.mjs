@@ -1097,7 +1097,7 @@ async function updateProgress(k) {
 // adopted: the CLI already runs this turn by itself (an unfolded steered message): bookkeeping only, nothing is sent.
 function startTurn(k, content, adopted = false) {
   const t = state.topics[k], s = live.get(k);
-  s.busy = true; t.busy = true; t.status = 'run'; statusSoon(k);
+  s.busy = true; t.busy = true; t.status = 'run'; statusSoon(k); closeMirrorCard(k, '↪ 已经接着聊了');
   // origin: 'owner' | 'agent:<topic>' (unset = the owner typed here); depth = agent hops behind this task (see send_to_agent)
   if (!adopted) s.silentNudged = !!content.silentNudge; // a summary turn is never nudged again
   if (content.reportTo || content.replyTo || content.origin) t.turnMeta = { reportTo: content.reportTo, replyTo: content.replyTo, origin: content.origin, depth: content.depth }; else delete t.turnMeta; // survives a restart
@@ -1641,7 +1641,11 @@ export function exchanges(msgs, n = 4, auto = false) {
       else if (auto && /^\s*<task-notification>/.test(text)) { if (!cur || cur.reply) out.push(cur = { user: '', auto: true, reply: '' }); }
       else cur = null;
     }
-    else if (m.type === 'assistant' && text && cur) cur.reply = text;
+    else if (m.type === 'assistant' && text && cur) {
+      cur.reply = text;
+      const acts = blocks.find(b => b.type === 'tool_use' && /wrap_up$/.test(b.name) && Array.isArray(b.input?.actions))?.input.actions;
+      if (acts?.length) cur.actions = acts.filter(a => a?.label && a?.message).slice(0, 6); // the card's quick replies
+    }
   }
   return out.filter(Boolean).slice(-n);
 }
@@ -1817,6 +1821,16 @@ function markMirror(t) {
   t.mirrorSid = t.sessionId;
 }
 let mirroring = false;
+// The desktop card's quick replies ("两批都训" …) as buttons under the mirrored answer. A tap = the owner sending that
+// action's message in the topic (same path as typing it: waits for the desktop's turn, then carries on the same session).
+const mirrorCards = new Map(); // topic key → wait id of its open quick-reply card
+function mirrorCard(k, html, acts) {
+  const t = state.topics[k];
+  askButtons(t.chatId, t.threadId, html, acts.map((a, i) => [a.label, String(i)]), true, { onId: id => mirrorCards.set(k, id) })
+    .then(v => { mirrorCards.delete(k); const a = v != null && acts[Number(v)]; if (a) return topicTurn({ message: { text: a.message }, from: { id: OWNER } }, k, [{ text: a.message }]); })
+    .catch(e => log('quick reply failed', e.message));
+}
+const closeMirrorCard = (k, note) => { const id = mirrorCards.get(k); if (id) { mirrorCards.delete(k); finishWait(id, -1, note); } };
 async function mirrorDesktop() {
   if (mirroring || state.paused) return;
   mirroring = true;
@@ -1843,8 +1857,13 @@ async function mirrorDesktop() {
       if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) continue;
       t.mirrorAt = at + r.used; save();
       const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
+      closeMirrorCard(k, '💻 已在桌面上回复'); // the desktop moved on: an older card's buttons would answer a stale question
       const msgs = r.ex.length > 3 ? [`🖥 桌面上新增了 ${r.ex.length} 轮对话，/history 查看`] : r.ex.map(mirrorHtml);
-      for (const h of msgs) await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
+      const acts = r.ex.length <= 3 && r.ex.at(-1)?.actions;
+      for (const [i, h] of msgs.entries()) {
+        if (acts?.length && i === msgs.length - 1) mirrorCard(k, h, acts);
+        else await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
+      }
       for (const f of r.files || []) for (const [i, p] of f.paths.entries()) // what it sent you there (pictures, reports), same rules as send_file
         await sendFileTo(t, p, i ? undefined : `🖥 ${f.caption}`.trim()).catch(e => send(t.chatId, t.threadId, `⚠️ 桌面发的文件没能同步：${e.message}`, { disable_notification: true }));
     }
