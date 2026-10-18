@@ -3323,6 +3323,8 @@ if (IS_MAIN) {
   // The list stays in state until onStart, so an instance that dies before reaching Telegram doesn't forget them.
   state.interrupted = [...new Set([...(state.interrupted || []), ...Object.entries(state.topics).filter(([, t]) => t.busy).map(([k]) => k)])];
   for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
+  // A desktop card waiting on the previous process died with it (the desktop asks there again): no 🔴 left behind.
+  for (const t of Object.values(state.topics)) if (t.deskAsk) delete t.deskAsk;
   save();
   setInterval(() => mirrorDesktop().catch(e => log('mirror failed', e)), 20e3);
   setInterval(() => deskStatus().catch(e => log('desk status failed', e)), 30e3);
