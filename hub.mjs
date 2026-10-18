@@ -1675,7 +1675,12 @@ export function mirrorScan(buf, settled) {
   }
   const blocks = m => { const c = m.message?.content; return typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []; };
   let li = -1; rows.forEach((r, i) => { const b = blocks(r.m); if (r.m.type === 'user' && b.length && !b.some(x => x.type === 'tool_result')) li = i; }); // exchanges()' turn start
-  const done = (ex, used, waiting = false) => { const files = ex.flatMap(r => sentFiles(r.m)); return { ex: exchanges(ex.map(r => r.m), Infinity, true).filter(e => e.reply), used, waiting, ...(files.length ? { files } : {}) }; };
+  // A message with no answer of its own but a later one after it (sent mid-turn, answered together) is kept; a lone
+  // unanswered one (interrupted) is not.
+  const done = (ex, used, waiting = false) => {
+    const files = ex.flatMap(r => sentFiles(r.m)), all = exchanges(ex.map(r => r.m), Infinity, true);
+    return { ex: all.filter((e, i) => e.reply || (!e.auto && all.slice(i + 1).some(x => !x.auto))), used, waiting, ...(files.length ? { files } : {}) };
+  };
   if (li < 0 || !exchanges([rows[li].m], 1, true).length) return done(rows, end); // nothing is open (an interruption, a compaction…)
   const tail = rows.slice(li), last = tail.at(-1).m, lb = blocks(last), wrap = b => b.type === 'tool_use' && /wrap_up$/.test(b.name);
   const wraps = new Set(tail.flatMap(r => blocks(r.m).filter(wrap).map(b => b.id)));
@@ -1683,12 +1688,14 @@ export function mirrorScan(buf, settled) {
     : lb.length > 0 && lb.every(b => b.type === 'tool_result' && wraps.has(b.tool_use_id));
   const answered = onAnswer && !!exchanges(tail.map(r => r.m), 1, true)[0]?.reply;
   if (answered && (settled || last.message?.stop_reason === 'end_turn')) return done(rows, end);
-  return done(rows.slice(0, li), rows[li].at, answered);
+  // open: what the owner just said there (desktop / phone Remote Control), posted before the turn ends
+  const open = exchanges([rows[li].m], 1, true)[0]?.user;
+  return { ...done(rows.slice(0, li), rows[li].at, answered), ...(open ? { open } : {}) };
 }
 // One mirrored exchange as one message (≤ 4000 after escaping: the reply is cut shorter until it fits).
 export function mirrorHtml(e) {
   const cut = (s, n) => s.length > n ? `${s.slice(0, n).replace(/[\uD800-\uDBFF]$/, '')}…` : s;
-  for (let n = 3000; ; n -= 500) { const h = `${e.auto ? '🖥 桌面（后台任务结束后）：' : `🖥 桌面：\n<b>你：</b>${esc(cut(e.user, 500))}`}\n<b>Claude：</b>${esc(cut(e.reply, Math.max(n, 0)))}`; if (h.length <= 4000 || n <= 0) return h; }
+  for (let n = 3000; ; n -= 500) { const h = `${e.auto ? '🖥 桌面（后台任务结束后）：' : e.noUser ? '🖥 桌面：' : `🖥 桌面：\n<b>你：</b>${esc(cut(e.user, 500))}`}\n<b>Claude：</b>${e.reply ? esc(cut(e.reply, Math.max(n, 0))) : '（这句没有单独回复，和后面的一起处理了）'}`; if (h.length <= 4000 || n <= 0) return h; }
 }
 // One message: head, the exchanges as a collapsed quote (each side cut to 400 chars), tail; oldest dropped until it fits.
 export function introHtml(head, ex, tail = '') {
@@ -1865,8 +1872,16 @@ async function mirrorDesktop() {
         running ??= new Set((await externalSessions()).filter(x => x.status === 'busy' || ['working', 'blocked'].includes(x.state)).map(x => x.sessionId));
         if (!running.has(t.sessionId)) r = mirrorScan(buf, true);
       }
+      // What the owner just said there (on the desktop or from the phone via Remote Control) shows up at once, not only
+      // when that turn ends (a long-running session could hide it for hours); its exchange then posts the reply alone.
+      const announce = async () => {
+        if (!r.open || r.open === t.mirrorAnnounced || t.busy || t.mirrorSid !== t.sessionId) return;
+        t.mirrorAnnounced = r.open; save();
+        await send(t.chatId, t.threadId, `🖥 桌面上（含手机遥控）你说：\n<b>你：</b>${esc(r.open.slice(0, 1500))}\n<i>Claude 正在处理，做完把回复发过来。</i>`, { html: true, disable_notification: true });
+      };
       // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
-      if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) continue;
+      if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) { if (t.mirrorAt === at) await announce(); continue; }
+      for (const e of r.ex) if (e.user && e.user === t.mirrorAnnounced) { e.noUser = true; delete t.mirrorAnnounced; } // already shown
       t.mirrorAt = from + r.used; save();
       if (from > at) await send(t.chatId, t.threadId, '🖥 桌面上新增了很多内容（含大量图片），下面是最近的几轮，更早的用 /history 看', { disable_notification: true });
       const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
@@ -1881,6 +1896,7 @@ async function mirrorDesktop() {
       }
       for (const f of r.files || []) for (const [i, p] of f.paths.entries()) // what it sent you there (pictures, reports), same rules as send_file
         await sendFileTo(t, p, i ? undefined : `🖥 ${f.caption}`.trim()).catch(e => send(t.chatId, t.threadId, `⚠️ 桌面发的文件没能同步：${e.message}`, { disable_notification: true }));
+      await announce(); // a newer message already open after the finished ones
     }
   } finally { mirroring = false; }
 }
@@ -2261,6 +2277,14 @@ async function selfTest() {
   for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) { const n = readSidebar(c.sidebarDir).length; ok(n > 0, `${c.label} 侧边栏：${n} 个会话`); }
   const ts = Object.values(state.topics).filter(t => !t.deleted && !t.isDispatcher);
   L.push(`📋 话题 ${ts.length} 个：${ts.map(t => t.shownName || t.title).join('、').slice(0, 600)}`);
+  // Desktop → topic sync per topic: transcript size vs what the mirror has read, desktop process state, why it may be held.
+  const procs = new Map((rows || []).filter(r => r.kind === 'interactive').map(r => [r.sessionId, r.status]));
+  for (const [k, t] of Object.entries(state.topics)) if (!t.deleted && !t.isDispatcher && !isCodex(t) && t.sessionId) {
+    let size = null; try { size = fs.statSync(transcriptPath(t)).size; } catch {}
+    const s = live.get(k), mb = n => `${(n / 1048576).toFixed(1)}MB`;
+    const held = [t.busy && 'Hub 在跑', s?.waiting && '等批准', s?.queue.length && '有排队', (s?.steerIds?.size || s?.cliQueued) && '插话未完', t.mirrorSid !== t.sessionId && '会话换了'].filter(Boolean);
+    L.push(`🪞 ${t.title}：记录 ${size == null ? '找不到' : mb(size)}，已同步到 ${t.mirrorAt == null ? '–' : mb(t.mirrorAt)}${size != null && t.mirrorAt != null ? `（差 ${Math.round((size - t.mirrorAt) / 1024)}KB）` : ''} · 桌面${procs.has(t.sessionId) ? procs.get(t.sessionId) : '没开'}${held.length ? ` · 暂停原因：${held.join('、')}` : ''}`);
+  }
   try {
     const log = fs.readFileSync(path.join(HOME, 'logs', `hub-${new Date().toISOString().slice(0, 10)}.log`), 'utf8');
     const n = re => (log.match(re) || []).length;
@@ -2303,7 +2327,9 @@ async function runControl(cmd, arg, m) {
   // log [text]: today's last 40 log lines (containing text), redacted, for looking at the other machine from here
   const logTail = () => { try { const L = fs.readFileSync(path.join(HOME, 'logs', `hub-${new Date().toISOString().slice(0, 10)}.log`), 'utf8').trim().split('\n').filter(l => !/hook \/recap|status line/.test(l) && (!arg || l.includes(arg))); return `📜 ${CFG.machine} 日志${arg ? `（含「${arg}」）` : ''}：\n${redact(L.slice(-40).join('\n')).slice(-3500)}`; } catch (e) { return `📜 ${CFG.machine} 没有今天的日志：${e.message}`; } };
   const text = await (cmd === 'selftest' ? selfTest() : cmd === 'tidy' ? tidyTopics() : cmd === 'avatar' ? setAvatarFrom(m) : cmd === 'log' ? logTail() : probe()).catch(e => `⚠️ ${CFG.machine} ${cmd} 失败：${e.message}`);
-  return send(CFG.exchange, exThread('machine'), text);
+  const sent = await send(CFG.exchange, exThread('machine'), text);
+  if (!sent) await send(CFG.exchange, exThread('machine'), `⚠️ ${CFG.machine} ${cmd} 的结果发不出去（${text.length} 字），截短重发：\n${text.slice(-1500)}`); // a log reply used to vanish silently
+  return sent;
 }
 // The other machine runs cmd and answers in 🤖 机器通道.
 export async function sendControlFile(machine, cmd, file) { await postToExchange({ to: machine, file, caption: `🛠 → ${machine} ${cmd}` }); }

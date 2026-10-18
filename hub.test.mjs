@@ -419,7 +419,12 @@ test('desktop mirror: new transcript bytes → finished exchanges and the bytes 
   buf = B(u('看看'), a(null, { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '看完了' } }), u([{ type: 'tool_result', tool_use_id: 'w', content: '' }]));
   assert.deepEqual(mirrorScan(buf, true).ex, [{ user: '看看', reply: '看完了' }]);
   // Only a user line so far / no answer before the next one (interrupted): not posted.
-  assert.deepEqual(mirrorScan(B(u('在吗')), true), { ex: [], used: 0, waiting: false });
+  assert.deepEqual(mirrorScan(B(u('在吗')), true), { ex: [], used: 0, waiting: false, open: '在吗' }); // shown at once, answered later
+  // said mid-turn, answered together with the next one: kept (not dropped for having no answer of its own)
+  const mid = mirrorScan(B(u('先查日志'), u('顺便看下配置'), a('end_turn', text('都看完了'))), false);
+  assert.deepEqual(mid.ex, [{ user: '先查日志', reply: '' }, { user: '顺便看下配置', reply: '都看完了' }]);
+  assert.match(mirrorHtml(mid.ex[0]), /和后面的一起处理/);
+  assert.equal(mirrorHtml({ user: 'x', reply: 'y', noUser: true }), '🖥 桌面：\n<b>Claude：</b>y'); // announced earlier: the answer alone
   buf = B(u('算了'), u('[Request interrupted by user]')); r = mirrorScan(buf, false);
   assert.deepEqual([r.ex, r.used], [[], buf.length]); // the interruption opens nothing typed
   // The session woke up by itself (background task done): posted with no user side; a notification mid-turn stays in that turn.
