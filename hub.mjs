@@ -1128,8 +1128,8 @@ async function endTurn(k, err) {
   if (s.progMsg) { bot.api.deleteMessage(t.chatId, s.progMsg).catch(() => {}); s.progMsg = null; }
   const took = Date.now() - (s.turnStart || Date.now());
   // Worked (tools) but said nothing: one follow-up turn asks for the summary instead of posting an empty answer.
-  const silent = !s.buf.trim() && !err && (s.steps || 0) > 0 && !t.isDispatcher && !s.silentNudged;
-  const text = (s.buf.trim() || (err ? '' : '（本轮没有文字回复）')) + (err ? `\n\n${err}` : '') + (took > 60e3 ? `\n\n⏱ 用时 ${fmtElapsed(took)} · ${s.steps} 步` : '');
+  const silent = !s.buf.trim() && !err && !t.isDispatcher && !s.silentNudged; // tools or not: an empty answer is never the answer
+  const text = s.buf.trim() + (err ? `\n\n${err}` : '') + (s.buf.trim() && took > 60e3 ? `\n\n⏱ 用时 ${fmtElapsed(took)} · ${s.steps} 步` : '');
   // Snapshot this turn before the first await: a message arriving while the answer is sent starts the next turn and overwrites these.
   const turn = { reportTo: s.reportTo, replyTo: s.replyTo, origin: s.origin, depth: s.depth, assigned: s.assigned, nudged: s.nudged, handedOff: s.handedOff, handedTo: s.handedTo, afterTurn: s.afterTurn, limited: s.limited, lastBuf: s.buf.trim() };
   // Files and the end snapshot too: a message arriving while the answer is sent starts the next turn, which changes files.
@@ -1141,7 +1141,7 @@ async function endTurn(k, err) {
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
   // resumes the transcript); whatever was queued since goes to the fresh session.
   if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
-  if (!silent) await send(t.chatId, t.threadId, t.isCommand ? `🗣 ${text}` : text, { md: true }); // 上朝: a fixed prefix, so the reply can never read as a relay to the peer hub
+  if (!silent && text.trim()) await send(t.chatId, t.threadId, t.isCommand ? `🗣 ${text}` : text, { md: true }); // nothing to say: say nothing // 上朝: a fixed prefix, so the reply can never read as a relay to the peer hub
   if (!t.isDispatcher) postTurnDiff(k, before, after).catch(e => log('turn diff failed', e.message)).then(() => files.length && sendTurnFiles(k, files)).catch(e => log('auto send failed', e));
   refreshSoon(); refreshCardSoon(k, 500);
   // A task assigned to a 圣旨 must end up in a project topic. If it answered by itself, it gets one firm retry and
@@ -1838,15 +1838,17 @@ async function mirrorDesktop() {
   try {
     for (const [k, t] of Object.entries(state.topics)) {
       const s = live.get(k);
-      if (!t.sessionId || t.isDispatcher || isCodex(t) || t.deleted || t.closed || t.busy || s?.busy || s?.waiting || s?.queue.length || s?.steerIds?.size || s?.cliQueued) continue;
+      if (!t.sessionId || t.isDispatcher || isCodex(t) || t.deleted || t.closed || t.busy || s?.busy || s?.waiting || s?.queue.length || ((s?.steerIds?.size || s?.cliQueued) && Date.now() - (s.idleSince || 0) < 120e3)) continue; // a stale queued count must not stop the mirror
       const f = transcriptPath(t);
       let st; try { st = fs.statSync(f); } catch { continue; }
       const at = t.mirrorAt;
       if (t.mirrorSid !== t.sessionId || at == null || st.size < at) { markMirror(t); save(); continue; }
       if (st.size === at) continue;
-      if (st.size - at > 32 * 1048576) { t.mirrorAt = st.size; save(); await send(t.chatId, t.threadId, '🖥 桌面上新增了很多对话，/history 查看', { disable_notification: true }); continue; }
-      const buf = Buffer.alloc(st.size - at), fd = fs.openSync(f, 'r');
-      try { fs.readSync(fd, buf, 0, buf.length, at); } finally { fs.closeSync(fd); }
+      // A huge jump (screenshots inline in the transcript): only the last 8 MB is read — its cut first line doesn't parse and is
+      // skipped, what came before stays for /history. Giving up there (as before) left the topic silent.
+      const from = Math.max(at, st.size - 8 * 1048576);
+      const buf = Buffer.alloc(st.size - from), fd = fs.openSync(f, 'r');
+      try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
       let r = mirrorScan(buf, false);
       // Settled = no write for 30 s and not mid-turn on the desktop (a text block can sit there while a long tool call streams).
       if (r.waiting && Date.now() - st.mtimeMs > 30e3) {
@@ -1855,14 +1857,17 @@ async function mirrorDesktop() {
       }
       // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
       if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) continue;
-      t.mirrorAt = at + r.used; save();
+      t.mirrorAt = from + r.used; save();
+      if (from > at) await send(t.chatId, t.threadId, '🖥 桌面上新增了很多内容（含大量图片），下面是最近的几轮，更早的用 /history 看', { disable_notification: true });
       const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
       closeMirrorCard(k, '💻 已在桌面上回复'); // the desktop moved on: an older card's buttons would answer a stale question
-      const msgs = r.ex.length > 3 ? [`🖥 桌面上新增了 ${r.ex.length} 轮对话，/history 查看`] : r.ex.map(mirrorHtml);
-      const acts = r.ex.length <= 3 && r.ex.at(-1)?.actions;
+      const shown = r.ex.slice(-8); // each exchange its own message; a long backlog: the newest 8 (the rest via /history)
+      if (r.ex.length > 8) await send(t.chatId, t.threadId, `🖥 桌面上新增了 ${r.ex.length} 轮对话，下面是最近 8 轮（更早的用 /history 看）`, { disable_notification: true });
+      const msgs = shown.map(mirrorHtml);
+      const acts = r.ex.at(-1)?.actions;
       for (const [i, h] of msgs.entries()) {
         if (acts?.length && i === msgs.length - 1) mirrorCard(k, h, acts);
-        else await send(t.chatId, t.threadId, h, { html: r.ex.length <= 3, disable_notification: true });
+        else await send(t.chatId, t.threadId, h, { html: true, disable_notification: true });
       }
       for (const f of r.files || []) for (const [i, p] of f.paths.entries()) // what it sent you there (pictures, reports), same rules as send_file
         await sendFileTo(t, p, i ? undefined : `🖥 ${f.caption}`.trim()).catch(e => send(t.chatId, t.threadId, `⚠️ 桌面发的文件没能同步：${e.message}`, { disable_notification: true }));
@@ -2285,7 +2290,9 @@ async function setAvatarFrom(m) {
 async function runControl(cmd, arg, m) {
   const probe = () => new Promise(res => execFile('osascript', ['-l', 'JavaScript', path.join(HOME, 'desktop-approve.js'), '--probe', ...(arg ? [arg] : [])], { timeout: 120000 },
     (e, out, err) => res(`🔎 ${CFG.machine} 界面探测${arg ? `（切到「${arg}」）` : ''}：\n${(String(out).trim() || String(err || e?.message || '').trim()).slice(0, 3500)}`)));
-  const text = await (cmd === 'selftest' ? selfTest() : cmd === 'tidy' ? tidyTopics() : cmd === 'avatar' ? setAvatarFrom(m) : probe()).catch(e => `⚠️ ${CFG.machine} ${cmd} 失败：${e.message}`);
+  // log [text]: today's last 40 log lines (containing text), redacted, for looking at the other machine from here
+  const logTail = () => { try { const L = fs.readFileSync(path.join(HOME, 'logs', `hub-${new Date().toISOString().slice(0, 10)}.log`), 'utf8').trim().split('\n').filter(l => !/hook \/recap|status line/.test(l) && (!arg || l.includes(arg))); return `📜 ${CFG.machine} 日志${arg ? `（含「${arg}」）` : ''}：\n${redact(L.slice(-40).join('\n')).slice(-3500)}`; } catch (e) { return `📜 ${CFG.machine} 没有今天的日志：${e.message}`; } };
+  const text = await (cmd === 'selftest' ? selfTest() : cmd === 'tidy' ? tidyTopics() : cmd === 'avatar' ? setAvatarFrom(m) : cmd === 'log' ? logTail() : probe()).catch(e => `⚠️ ${CFG.machine} ${cmd} 失败：${e.message}`);
   return send(CFG.exchange, exThread('machine'), text);
 }
 // The other machine runs cmd and answers in 🤖 机器通道.
@@ -2295,7 +2302,7 @@ async function onPeerMessage(m) {
   const raw = m.text || m.caption || '', sg = splitSig(raw), text = sg.body, doc = m.document, r = m.text ? parseRelay(text, CFG.machine) : null;
   const pk = /^🔑 → (\S+) ([A-Za-z0-9+/]+=*)$/u.exec(raw.trim());
   if (pk) return pk[1] === CFG.machine ? onPeerKey(pk[2]) : undefined;
-  const ctl = /^🛠 → (\S+) (selftest|tidy|axprobe|avatar)(?: (.{1,100}))?$/u.exec(text.trim()); // the other hub asks this one to check / tidy itself
+  const ctl = /^🛠 → (\S+) (selftest|tidy|axprobe|avatar|log)(?: (.{1,100}))?$/u.exec(text.trim()); // the other hub asks this one to check / tidy itself
   if (ctl && ctl[1] !== CFG.machine) return;
   if (!r && !ctl && !(doc && text.split('\n')[0].includes(`→ ${CFG.machine}`))) return; // its acks, reports, items for someone else
   const isBundle = /^agent-hub(-mac)?\.zip$/i.test(doc?.file_name || '');
