@@ -1015,7 +1015,9 @@ function startSession(k) {
         // A message steered in while the turn was already answering runs as a turn of its own: track it as one (no report /
         // result obligations), so its answer, files and diff reach the topic and later messages steer into it, not end it.
         // cliQueued: the last result said the CLI runs more sends by itself. Subagent frames (background agents) never start one.
-        if (!s.busy && (s.steerIds.size || s.cliQueued) && (m.type === 'assistant' && !m.parent_tool_use_id || m.type === 'result') && live.get(k) === s) startTurn(k, [], true);
+        // A turn the session started by itself (a background task finished, a queued message) is ours too: its answer is
+        // posted, the status shows it, and restarts wait for it (before, such turns ran unseen and a deploy cut one off).
+        if (!s.busy && live.get(k) === s && (m.type === 'assistant' && !m.parent_tool_use_id || m.type === 'result' && (s.steerIds.size || s.cliQueued))) startTurn(k, [], true);
         if (m.type === 'system' && m.subtype === 'init') {
           if (t.sessionId !== m.session_id) {
             const fresh = !t.sessionId;
@@ -1600,7 +1602,9 @@ const NOT_TYPED = /^\s*(<(task-notification|system-reminder|command-name|command
 const HUB_WRAP = /^(（Agent Hub 补充的背景[\s\S]*?（补充背景到此结束）\s*)?(这是用户布置的任务，直接开始做：|这个任务由 agent 发起（[^\n]*|「上朝」派来的任务（[^\n]*)?\s*/;
 // The other side's turns, as background (not a request): Telegram ones for the desktop, or for a hub branch that lacks them.
 export const recapText = (ex, intro) => `（Agent Hub 补充的背景，不是新的请求：${intro}，下面这几轮你现在的对话记录里没有，了解一下上下文即可。）\n\n${
-  ex.map(e => `【Telegram ${fmtHM(e.at)}】\n用户：${e.user || '（图片 / 文件）'}\nClaude：${e.reply || '（没有文字回复）'}`).join('\n\n')}\n\n（补充背景到此结束）`;
+  ex.slice(-3).map(e => `【Telegram ${fmtHM(e.at)}】\n用户：${cutTo(e.user, 300) || '（图片 / 文件）'}\nClaude：${cutTo(e.reply, 800) || '（没有文字回复）'}`).join('\n\n')}\n\n（补充背景到此结束）`;
+// Recaps stay small: the newest 3 turns, each side cut (they were re-sent whole on every resume and filled the context).
+const cutTo = (s, n) => { s = String(s || ''); return s.length > n ? `${s.slice(0, n).replace(/[\uD800-\uDBFF]$/, '')}…` : s; };
 // tgLog entries the transcript's newest message doesn't descend from (the hub resumes there; the desktop wrote last).
 export function missingTg(lines, log) {
   const parent = new Map(); let leaf = null;
@@ -1611,7 +1615,13 @@ export function missingTg(lines, log) {
 function tgRecap(t) {
   const log = (t.tgLog || []).filter(e => e.sid === t.sessionId);
   if (!log.length) return '';
-  try { const ex = missingTg(fs.readFileSync(transcriptPath(t), 'utf8').split('\n'), log); return ex.length ? recapText(ex, '这个会话在桌面 App 上也聊过，桌面那边接着写时没有带上用户在手机 Telegram 里和你聊的') : ''; } catch { return ''; }
+  try {
+    // Each Telegram turn is recapped here once: the desktop's branch never gains it, so it would come back on every resume.
+    const ex = missingTg(fs.readFileSync(transcriptPath(t), 'utf8').split('\n'), log).filter(e => !(t.tgRecapped || []).includes(e.leaf));
+    if (!ex.length) return '';
+    t.tgRecapped = [...(t.tgRecapped || []), ...ex.map(e => e.leaf)].slice(-50); save();
+    return recapText(ex, '这个会话在桌面 App 上也聊过，桌面那边接着写时没有带上用户在手机 Telegram 里和你聊的');
+  } catch { return ''; }
 }
 // UserPromptSubmit HTTP hook (/approvals on adds it): a desktop / terminal prompt in a topic's session gets the Telegram
 // turns that side hasn't been told about yet. The hub's own prompts (same session id) are skipped by their timing.
@@ -2780,7 +2790,7 @@ async function onMessage(ctx) {
   if (!g && !CFG.commandGroups?.[String(chatId)] && !seenUnknown.has(chatId) && !(state.unknownNoted || []).includes(chatId)) { // a group we were added to but don't know yet
     seenUnknown.add(chatId);
     // The other hub's group (its bot is in it: added there for the offline avatars) is not news; any other group once.
-    const peerHere = state.peerBotId && await bot.api.getChatMember(chatId, state.peerBotId).then(x => !['left', 'kicked'].includes(x.status), () => false);
+    const peerHere = await bot.api.getChatAdministrators(chatId).then(a => a.some(x => x.user.is_bot && isPeerBot(x.user)), () => false); // the peer hub's bot is admin there
     (state.unknownNoted ??= []).push(chatId); save();
     log('unknown group', chatId, ctx.chat.title, peerHere ? '(the other hub\'s)' : '');
     if (!peerHere) notifyOwner(`👋 ${CFG.machine} 的 bot 在一个还没配置的群里收到了消息：「${ctx.chat.title}」（id ${chatId}）。`);
