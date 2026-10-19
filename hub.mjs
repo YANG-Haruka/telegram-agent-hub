@@ -1551,7 +1551,9 @@ function startCodexSession(k) {
   s.push = async msg => {
     await ready;
     if (closed) return;
-    const r = await rpc.call('turn/start', { threadId, input: codexInput(msg.message.content), approvalPolicy: codexPolicy(modeOf(t)), effort: effortOf(t), // never a model: that stays config.toml's
+    // Codex gets no system prompt from the hub: the reply-language rule rides along as the turn's first input (the mirror drops it)
+    const lang = CFG.replyLanguage === '' ? [] : [{ type: 'text', text: `（Hub：给用户的每一句话都用${CFG.replyLanguage || '中文'}，代码、命令、文件名、报错原文除外。）` }];
+    const r = await rpc.call('turn/start', { threadId, input: [...lang, ...codexInput(msg.message.content)], approvalPolicy: codexPolicy(modeOf(t)), effort: effortOf(t), // never a model: that stays config.toml's
       ...(CFG.codexServiceTier === 'default' ? { serviceTierForTurn: 'default' } : {}) }).catch(async e => { await endTurn(k, `⚠️ ${e.message}`); return null; });
     if (r?.turn?.id) turnId = r.turn.id;
   };
@@ -1909,7 +1911,7 @@ export function codexScan(buf) {
     if (j.type === 'event_msg' && p.type === 'task_started') { open = true; user = []; }
     else if (j.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       const txt = (p.content || []).filter(c => c.type === 'input_text').map(c => c.text).join('\n').trim();
-      if (txt && !/^\s*<|^# AGENTS\.md/.test(txt) && !user.includes(txt)) user.push(txt);
+      if (txt && !/^\s*<|^# AGENTS\.md|^（Hub：/.test(txt) && !user.includes(txt)) user.push(txt);
     } else if (j.type === 'event_msg' && (p.type === 'task_complete' || p.type === 'turn_aborted')) {
       if (p.type === 'task_complete' && p.last_agent_message) ex.push({ user: user.join('\n') || '（图片 / 文件）', reply: p.last_agent_message, who: 'Codex' });
       user = []; open = false; used = nl + 1;
