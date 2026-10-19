@@ -979,6 +979,9 @@ const secretGuard = k => async input => {
     ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: admin ? 'Hub 的密钥、登录文件和环境变量不允许读取或修改（Hub 的代码可以）。' : 'Hub 的目录、密钥、登录文件和环境变量不允许读取或修改。' } }
     : {};
 };
+// The rule in PHONE_PROMPT sits after Claude Code's long English system prompt and wore off in long turns: repeated as hidden
+// context on every prompt (config replyLanguage, default 中文; '' turns it off).
+const replyLanguage = async () => CFG.replyLanguage === '' ? {} : { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `提醒：这一轮给用户的每一句话（中途汇报、最后总结、表格都算）都用${CFG.replyLanguage || '中文'}，代码、命令、文件名、报错原文除外。` } };
 function startSession(k) {
   const t = state.topics[k];
   if (CFG.agents[t.agent]?.type === 'codex' && !t.isDispatcher) return startCodexSession(k);
@@ -1006,7 +1009,7 @@ function startSession(k) {
       env: agentEnv(accountOf(t)),
       systemPrompt: { type: 'preset', preset: 'claude_code', append },
       mcpServers: { tg: tgServer(k) },
-      hooks: { PreToolUse: [{ hooks: [secretGuard(k)] }], PostToolUse: [{ hooks: [auditTool(k)] }] }, // run in every permission mode, auto included
+      hooks: { PreToolUse: [{ hooks: [secretGuard(k)] }], PostToolUse: [{ hooks: [auditTool(k)] }], UserPromptSubmit: [{ hooks: [replyLanguage] }] }, // run in every permission mode, auto included
       canUseTool: (name, input, opts) => askPermission(k, name, input, opts),
     },
   });
