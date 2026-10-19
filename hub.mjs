@@ -1111,7 +1111,7 @@ function startTurn(k, content, adopted = false) {
   progressSoon(k);
   const typing = () => bot.api.sendChatAction(t.chatId, 'typing', { message_thread_id: t.threadId }).catch(() => {});
   typing(); s.typing = setInterval(typing, 4500);
-  if (adopted) { s.before = snapTree(s, t); s.pushed = Promise.resolve(); return; }
+  if (adopted) { s.turnText = '（后台任务结束后自己接着做）'; s.before = snapTree(s, t); s.pushed = Promise.resolve(); return; } // not the last owner message again
   s.promptAt = Date.now(); s.turnText = Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text).join('\n') : '';
   if (s.recapCheck && Array.isArray(content)) { s.recapCheck = false; const r = tgRecap(t); if (r) content.unshift({ type: 'text', text: r }); }
   const msg = { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: t.sessionId || '' };
@@ -1629,6 +1629,9 @@ function tgRecap(t) {
 function onDesktopPrompt(req) {
   const sid = req?.session_id;
   if (!sid || state.paused) return {};
+  // Only a prompt someone typed: a session waking itself (task notification, either on the desktop or in the hub's own
+  // process) would use up the recap without anyone at the desktop reading it.
+  if (NOT_TYPED.test(String(req.prompt || ''))) return {};
   for (const [k, s] of live) if (state.topics[k]?.sessionId === sid && Date.now() - (s.promptAt || 0) < 15e3) return {};
   const ts = Object.values(state.topics).filter(t => t.sessionId === sid && !t.isDispatcher);
   const ex = ts.flatMap(t => (t.tgLog || []).filter(e => e.sid === sid && e.at > (t.deskSeen || 0))).sort((a, b) => a.at - b.at);
@@ -3442,6 +3445,7 @@ if (IS_MAIN) {
     if (started) return log('poller restarted');
     started = true;
     log(`hub started as @${me.username} v${HUB_VERSION}`);
+    if (state.recapV !== 2) { state.recapV = 2; for (const t of Object.values(state.topics)) delete t.deskSeen; save(); }
     syncGroupPhotos(true).catch(e => log('group photos failed', e.message));
     loadTopicIcon().then(async () => { if (!topicIconId) return; for (const t of Object.values(state.topics)) if (!t.deleted && !t.isDispatcher && t.threadId && t.iconId !== topicIconId && ownGroups().some(([id]) => id === String(t.chatId)))
       await bot.api.editForumTopic(t.chatId, t.threadId, { icon_custom_emoji_id: topicIconId }).then(() => { t.iconId = topicIconId; save(); }, e => /NOT_MODIFIED/.test(e.description || '') ? (t.iconId = topicIconId, save()) : log('topic icon failed', e.description || e.message)); }).catch(e => log('topic icon failed', e.message)); refreshPanels(); heartbeat().then(() => setTimeout(watchPeers, 60e3)); dailyChecks(); announceUnpaired();
