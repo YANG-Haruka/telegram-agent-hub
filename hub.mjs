@@ -2545,6 +2545,15 @@ export function partitionSidebar(byAgent) {
   for (const a in out) out[a].sort((x, y) => y.lastActivityAt - x.lastActivityAt);
   return out;
 }
+// Sessions archived in the desktop app (isArchived in its sidebar) and Codex threads moved to ~/.codex/archived_sessions.
+function archivedSessions() {
+  const ids = new Set();
+  const walk = d => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/^local_.*.json$/.test(e.name)) try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (j.isArchived && j.cliSessionId) ids.add(j.cliSessionId); } catch {} } };
+  for (const c of Object.values(CFG.agents)) if (c.sidebarDir) walk(c.sidebarDir.replace(/^~(?=$|[\/])/, os.homedir()));
+  try { for (const n of fs.readdirSync(path.join(CODEX_HOME(), 'archived_sessions'))) { const m = /([0-9a-f]{8}-[0-9a-f-]{27}).jsonl/i.exec(n); if (m) ids.add(m[1]); } } catch {}
+  return ids;
+}
 function readSidebar(dir) {
   const rows = [];
   const walk = d => {
@@ -2623,6 +2632,15 @@ async function autoSync() {
         await sendIntro(t, `🖥 Codex 桌面（或手机遥控）上的对话「${title}」，已自动同步过来。`, r.ex.slice(-4), `目录：${meta.cwd}\n那边接着聊会同步到这里；在这里发消息也能接着做。`);
         log('auto-synced codex', id, title);
       }
+    }
+    // Archived on the desktop (or in Codex) → its topic goes too (not while the hub runs a turn there; a copy of the session
+    // still open in the other desktop instance keeps it).
+    const gone = archivedSessions(), open = new Set(Object.values(sidebarRows()).flat().map(r => r.cliSessionId));
+    for (const [k, t] of Object.entries(state.topics)) {
+      if (!t.sessionId || t.isDispatcher || t.deleted || !gone.has(t.sessionId) || open.has(t.sessionId) || t.busy || live.get(k)?.busy) continue;
+      closeLive(k);
+      await bot.api.deleteForumTopic(t.chatId, t.threadId).catch(e => log('archived topic delete failed', e.description || e.message));
+      topicGone(t.chatId, t.threadId); log('topic deleted: archived on the desktop', t.sessionId, t.title);
     }
     // Renamed on the desktop → the topic follows. Only a change seen here counts (the first sight is just recorded), so a
     // topic renamed in Telegram keeps its name until the desktop title changes again.
