@@ -565,3 +565,19 @@ test('desktop quick replies (wrap_up actions) ride along with the mirrored answe
   assert.equal(r.ex[0].reply, '查完了\n按两批重训？');
   assert.deepEqual(r.ex[0].actions, [{ label: '两批都训', message: '8 个按两批重训。' }, { label: '只训第一批', message: '先训第一批。' }]);
 });
+
+import { codexScan } from './hub.mjs';
+test('Codex desktop rollout: turns → exchanges; a running turn shows what the owner said', () => {
+  const L = (type, payload) => JSON.stringify({ type, payload }) + '\n';
+  const msg = text => L('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+  const done = [L('event_msg', { type: 'task_started' }), msg('<environment_context>cwd</environment_context>'), msg('查一下航班'), L('response_item', { type: 'reasoning' }), L('event_msg', { type: 'task_complete', last_agent_message: '查好了' })];
+  const running = [L('event_msg', { type: 'task_started' }), msg('再看看 JAL')];
+  const buf = Buffer.from([...done, ...running].join(''));
+  const r = codexScan(buf);
+  assert.deepEqual(r.ex, [{ user: '查一下航班', reply: '查好了', who: 'Codex' }]);
+  assert.equal(r.used, Buffer.byteLength(done.join(''))); // the running turn is read again next time
+  assert.equal(r.open, '再看看 JAL');
+  const fin = codexScan(Buffer.from([...running, L('event_msg', { type: 'task_complete', last_agent_message: 'JAL 也行' })].join('')));
+  assert.deepEqual([fin.ex, fin.open], [[{ user: '再看看 JAL', reply: 'JAL 也行', who: 'Codex' }], undefined]);
+  assert.deepEqual(codexScan(Buffer.from(L('event_msg', { type: 'task_started' }) + msg('x') + L('event_msg', { type: 'turn_aborted' }))).ex, []);
+});

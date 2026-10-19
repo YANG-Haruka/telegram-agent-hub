@@ -923,6 +923,7 @@ async function deskStatus() {
   if (CFG.topicStatus === false || state.paused) return;
   const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
   deskBusy = new Set(rows.filter(r => r.status === 'busy' || r.state === 'working').map(r => r.sessionId));
+  for (const t of Object.values(state.topics)) if (isCodex(t) && t.sessionId && !t.deleted) { const f = codexRollout(t.sessionId); if (f && codexBusy(f)) deskBusy.add(t.sessionId); }
   const running = new Set(rows.map(r => r.sessionId)); // a closed process took its background tasks with it
   deskBg = new Set();
   for (const t of Object.values(state.topics)) if (t.sessionId && !t.isDispatcher && !t.deleted && !t.closed && !isCodex(t) && running.has(t.sessionId)) {
@@ -1695,13 +1696,13 @@ export function mirrorScan(buf, settled) {
 // One mirrored exchange as one message (≤ 4000 after escaping: the reply is cut shorter until it fits).
 export function mirrorHtml(e) {
   const cut = (s, n) => s.length > n ? `${s.slice(0, n).replace(/[\uD800-\uDBFF]$/, '')}…` : s;
-  for (let n = 3000; ; n -= 500) { const h = `${e.auto ? '🖥 桌面（后台任务结束后）：' : e.noUser ? '🖥 桌面：' : `🖥 桌面：\n<b>你：</b>${esc(cut(e.user, 500))}`}\n<b>Claude：</b>${e.reply ? esc(cut(e.reply, Math.max(n, 0))) : '（这句没有单独回复，和后面的一起处理了）'}`; if (h.length <= 4000 || n <= 0) return h; }
+  for (let n = 3000; ; n -= 500) { const h = `${e.auto ? '🖥 桌面（后台任务结束后）：' : e.noUser ? '🖥 桌面：' : `🖥 桌面：\n<b>你：</b>${esc(cut(e.user, 500))}`}\n<b>${e.who || 'Claude'}：</b>${e.reply ? esc(cut(e.reply, Math.max(n, 0))) : '（这句没有单独回复，和后面的一起处理了）'}`; if (h.length <= 4000 || n <= 0) return h; }
 }
 // One message: head, the exchanges as a collapsed quote (each side cut to 400 chars), tail; oldest dropped until it fits.
 export function introHtml(head, ex, tail = '') {
   const cut400 = s => s.length > 400 ? `${s.slice(0, 400).replace(/[\uD800-\uDBFF]$/, '')}…` : s; // half an emoji: Telegram rejects the message
   for (let i = 0; ; i++) {
-    const e = ex.slice(i), quote = e.length && `<b>📜 之前的对话（最近 ${e.length} 轮）</b>\n<blockquote expandable>${e.map(x => `<b>你：</b>${esc(cut400(x.user))}\n<b>Claude：</b>${esc(cut400(x.reply) || '（没有文字回复）')}`).join('\n\n')}</blockquote>`;
+    const e = ex.slice(i), quote = e.length && `<b>📜 之前的对话（最近 ${e.length} 轮）</b>\n<blockquote expandable>${e.map(x => `<b>你：</b>${esc(cut400(x.user))}\n<b>${x.who || 'Claude'}：</b>${esc(cut400(x.reply) || '（没有文字回复）')}`).join('\n\n')}</blockquote>`;
     const html = [esc(head), quote, tail && esc(tail)].filter(Boolean).join('\n\n');
     if (html.length <= 4000 || !e.length) return html;
   }
@@ -1827,14 +1828,66 @@ function resumeHub(chatId, threadId) {
 // ---------- /fork and /handoff: carry a session's memory to another topic ----------
 const ownGroups = () => Object.entries(CFG.groups).filter(([, g]) => g.owner !== 'mac-hub');
 const claudeGroups = () => Object.entries(CFG.groups).filter(([, g]) => g.owner !== 'mac-hub' && CFG.agents[g.agent]?.type === 'claude');
+// ---------- Codex desktop (and its phone remote) → topics, like the Claude desktop mirror ----------
+// Threads: ~/.codex/session_index.jsonl (id, thread_name; last line per id wins). Each thread's log: a rollout file under
+// ~/.codex/sessions/YYYY/MM/DD/ named …-<id>.jsonl (first line session_meta: cwd, thread_source; then task_started /
+// user messages / task_complete with last_agent_message). The index of rollout paths is rebuilt at most every 10 min.
+const CODEX_HOME = () => process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+let rollouts = { at: 0, map: new Map() };
+function codexRollouts() {
+  if (Date.now() - rollouts.at < 600e3) return rollouts.map;
+  const map = new Map(), walk = (d, depth) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory() && depth < 3) walk(p, depth + 1); else { const m = /([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i.exec(e.name); if (m) map.set(m[1], p); } } };
+  walk(path.join(CODEX_HOME(), 'sessions'), 0);
+  rollouts = { at: Date.now(), map };
+  return map;
+}
+const codexRollout = id => { let f = codexRollouts().get(id); if (!f) { rollouts.at = 0; f = codexRollouts().get(id); } return f || null; };
+function codexTitles() {
+  const m = new Map();
+  try { for (const l of fs.readFileSync(path.join(CODEX_HOME(), 'session_index.jsonl'), 'utf8').split('\n')) { try { const j = JSON.parse(l); if (j.id && j.thread_name) m.set(j.id, j.thread_name); } catch {} } } catch {}
+  return m;
+}
+const codexMeta = f => { try { const fd = fs.openSync(f, 'r'), b = Buffer.alloc(65536); const n = fs.readSync(fd, b, 0, b.length, 0); fs.closeSync(fd); return JSON.parse(b.toString('utf8', 0, n).split('\n')[0]).payload || {}; } catch { return {}; } };
+// A Codex rollout's new bytes → finished exchanges (the user's message(s) of a turn + its last agent message), the bytes they
+// used, and open = what the owner said in a turn still running (posted at once, like the Claude mirror). Injected context
+// (AGENTS.md, <environment_context> …) is not a message.
+export function codexScan(buf) {
+  const ex = []; let used = 0, user = [], open = false;
+  for (let at = 0, nl; (nl = buf.indexOf(10, at)) >= 0; at = nl + 1) {
+    let j; try { j = JSON.parse(buf.toString('utf8', at, nl)); } catch { continue; }
+    const p = j?.payload || {};
+    if (j.type === 'event_msg' && p.type === 'task_started') { open = true; user = []; }
+    else if (j.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+      const txt = (p.content || []).filter(c => c.type === 'input_text').map(c => c.text).join('\n').trim();
+      if (txt && !/^\s*<|^# AGENTS\.md/.test(txt) && !user.includes(txt)) user.push(txt);
+    } else if (j.type === 'event_msg' && (p.type === 'task_complete' || p.type === 'turn_aborted')) {
+      if (p.type === 'task_complete' && p.last_agent_message) ex.push({ user: user.join('\n') || '（图片 / 文件）', reply: p.last_agent_message, who: 'Codex' });
+      user = []; open = false; used = nl + 1;
+    }
+  }
+  if (!open) used = buf.lastIndexOf(10) + 1;
+  return { ex, used, waiting: false, ...(open && user.length ? { open: user.join('\n') } : {}) };
+}
+// Mid-turn on the desktop / phone: the rollout's last turn event is a task_started, written within the last 30 min.
+function codexBusy(f) {
+  try {
+    const st = fs.statSync(f); if (Date.now() - st.mtimeMs > 1800e3) return false;
+    const n = Math.min(st.size, 1048576), b = Buffer.alloc(n), fd = fs.openSync(f, 'r'); fs.readSync(fd, b, 0, n, st.size - n); fs.closeSync(fd);
+    const t = b.toString('utf8'), a = t.lastIndexOf('"type":"task_started"'), c = Math.max(t.lastIndexOf('"type":"task_complete"'), t.lastIndexOf('"type":"turn_aborted"'));
+    return a > c;
+  } catch { return false; }
+}
+// The log the desktop mirror reads for a topic: Claude transcript or Codex rollout.
+const mirrorFile = t => isCodex(t) ? codexRollout(t.sessionId) : transcriptPath(t);
 const transcriptPath = t => path.join(os.homedir(), '.claude', 'projects', t.cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${t.sessionId}.jsonl`);
 
 // ---------- desktop → topic mirror: what the owner does with a topic's session in the desktop app shows up in the topic ----------
 // t.mirrorAt = transcript bytes already seen (of session t.mirrorSid). Set to the end whenever the hub binds a session or runs a
 // turn on it, so only what happened elsewhere is posted; a new / changed session or an unknown offset starts at the end (no backfill).
 function markMirror(t) {
-  if (!t?.sessionId || t.isDispatcher || isCodex(t)) return;
-  try { t.mirrorAt = fs.statSync(transcriptPath(t)).size; } catch { delete t.mirrorAt; }
+  if (!t?.sessionId || t.isDispatcher) return;
+  try { t.mirrorAt = fs.statSync(mirrorFile(t)).size; } catch { delete t.mirrorAt; }
   t.mirrorSid = t.sessionId;
 }
 let mirroring = false;
@@ -1855,9 +1908,9 @@ async function mirrorDesktop() {
   try {
     for (const [k, t] of Object.entries(state.topics)) {
       const s = live.get(k);
-      if (!t.sessionId || t.isDispatcher || isCodex(t) || t.deleted || t.closed || t.busy || s?.busy || s?.waiting || s?.queue.length || ((s?.steerIds?.size || s?.cliQueued) && Date.now() - (s.idleSince || 0) < 120e3)) continue; // a stale queued count must not stop the mirror
-      const f = transcriptPath(t);
-      let st; try { st = fs.statSync(f); } catch { continue; }
+      if (!t.sessionId || t.isDispatcher || t.deleted || t.closed || t.busy || s?.busy || s?.waiting || s?.queue.length || ((s?.steerIds?.size || s?.cliQueued) && Date.now() - (s.idleSince || 0) < 120e3)) continue; // a stale queued count must not stop the mirror
+      const f = mirrorFile(t);
+      let st; try { st = f && fs.statSync(f); } catch {} if (!st) continue;
       const at = t.mirrorAt;
       if (t.mirrorSid !== t.sessionId || at == null || st.size < at) { markMirror(t); save(); continue; }
       if (st.size === at) continue;
@@ -1866,7 +1919,7 @@ async function mirrorDesktop() {
       const from = Math.max(at, st.size - 8 * 1048576);
       const buf = Buffer.alloc(st.size - from), fd = fs.openSync(f, 'r');
       try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
-      let r = mirrorScan(buf, false);
+      let r = isCodex(t) ? codexScan(buf) : mirrorScan(buf, false);
       // Settled = no write for 30 s and not mid-turn on the desktop (a text block can sit there while a long tool call streams).
       if (r.waiting && Date.now() - st.mtimeMs > 30e3) {
         running ??= new Set((await externalSessions()).filter(x => x.status === 'busy' || ['working', 'blocked'].includes(x.state)).map(x => x.sessionId));
@@ -1877,7 +1930,7 @@ async function mirrorDesktop() {
       const announce = async () => {
         if (!r.open || r.open === t.mirrorAnnounced || t.busy || t.mirrorSid !== t.sessionId) return;
         t.mirrorAnnounced = r.open; save();
-        await send(t.chatId, t.threadId, `🖥 桌面上（含手机遥控）你说：\n<b>你：</b>${esc(r.open.slice(0, 1500))}\n<i>Claude 正在处理，做完把回复发过来。</i>`, { html: true, disable_notification: true });
+        await send(t.chatId, t.threadId, `🖥 桌面上（含手机遥控）你说：\n<b>你：</b>${esc(r.open.slice(0, 1500))}\n<i>${isCodex(t) ? 'Codex' : 'Claude'} 正在处理，做完把回复发过来。</i>`, { html: true, disable_notification: true });
       };
       // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
       if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) { if (t.mirrorAt === at) await announce(); continue; }
@@ -2504,9 +2557,32 @@ async function autoSync() {
         log('auto-synced', r.cliSessionId, t.title);
       }
     }
+    // Codex desktop / phone threads (thread_source "user": not its subagents, not the hub's own app-server threads, which
+    // already belong to topics): used after autoSyncFrom → a topic in the Codex group, bound to the thread itself.
+    const cg = ownGroups().find(([, g]) => CFG.agents[g.agent]?.type === 'codex');
+    if (cg) {
+      const have = new Set(Object.values(state.topics).map(t => t.sessionId).filter(Boolean)), names = codexTitles();
+      for (const [id, f] of codexRollouts()) {
+        if (have.has(id)) continue;
+        let st; try { st = fs.statSync(f); } catch { continue; }
+        if (st.mtimeMs <= state.autoSyncFrom) continue;
+        const meta = codexMeta(f);
+        if (meta.thread_source !== 'user' || !meta.cwd || !fs.existsSync(meta.cwd) || inside(HOME, meta.cwd) || inside(meta.cwd, HOME) || rootsAbs().some(x => norm(x) === norm(meta.cwd))) continue;
+        const title = names.get(id) || path.basename(meta.cwd);
+        const t = await createTopic(Number(cg[0]), cg[1].agent, meta.cwd, id, title);
+        // the last turns as the intro (its memory, visible here); a turn still running there is mirrored once it ends
+        const from = Math.max(0, st.size - 4 * 1048576), buf = Buffer.alloc(st.size - from), fd = fs.openSync(f, 'r');
+        try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+        const r = codexScan(buf);
+        t.deskTitle = names.get(id) ?? null; t.mirrorAt = from + r.used; t.mirrorSid = id; save();
+        await refreshCard(key(t.chatId, t.threadId)).catch(e => log('card failed', e));
+        await sendIntro(t, `🖥 Codex 桌面（或手机遥控）上的对话「${title}」，已自动同步过来。`, r.ex.slice(-4), `目录：${meta.cwd}\n那边接着聊会同步到这里；在这里发消息也能接着做。`);
+        log('auto-synced codex', id, title);
+      }
+    }
     // Renamed on the desktop → the topic follows. Only a change seen here counts (the first sight is just recorded), so a
     // topic renamed in Telegram keeps its name until the desktop title changes again.
-    const titles = new Map(Object.values(sidebarRows()).flat().map(r => [r.cliSessionId, r.title]));
+    const titles = new Map([...Object.values(sidebarRows()).flat().map(r => [r.cliSessionId, r.title]), ...codexTitles()]);
     for (const [k, t] of Object.entries(state.topics)) {
       const d = t.sessionId && !t.deleted && !t.closed && !t.isDispatcher && titles.get(t.sessionId);
       if (!d || d === t.deskTitle) continue;
