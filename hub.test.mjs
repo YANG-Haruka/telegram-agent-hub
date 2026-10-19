@@ -282,6 +282,8 @@ test('turn files: only what the agent wrote itself this turn (not what its comma
     assert.match(unsendable(inHub, fs.realpathSync(cwd), hub), /Hub/);
     assert.match(unsendable(path.join(root, '.ssh', 'k.txt'), cwd, hub), /密钥/); // outside the project: the whole path is checked
     assert.equal(unsendable(path.join(else_, 'report.md'), cwd, hub), null);
+    assert.equal(unsendable(path.join(cwd, '.xlsx-build', 'mockups', 'a.png'), fs.realpathSync(cwd), hub), null); // a build folder, not a key store
+    assert.match(unsendable(path.join(cwd, '.aws', 'config'), fs.realpathSync(cwd), hub), /密钥/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 import { parseNumstat, diffSummary, maskSecretDiff, gitTree } from './hub.mjs';

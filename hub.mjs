@@ -380,7 +380,8 @@ async function askPermission(k, toolName, input, opts) {
 // ---------- send_file tool (agent -> phone) ----------
 const PHOTO = /\.(jpe?g|png|gif|webp)$/i, VIDEO = /\.(mp4|mov|webm)$/i;
 // ponytail: name-based speed bump, not a guarantee (the agent can read any file anyway).
-const SECRET_NAME = /(^\.)|(\.env)|(\.pem$)|(\.key$)|(\.p12$)|(\.pfx$)|(^id_)|(credential)|(secret)|(token)/i;
+// Dot folders / files that hold logins and keys (not every hidden name: build folders like .xlsx-build hold plain output).
+const SECRET_NAME = /(^\.(ssh|aws|gnupg|azure|kube|docker|gcloud|config|password-store|npmrc|netrc|pypirc|git-credentials|htpasswd|codex|claude)$)|(\.env)|(\.pem$)|(\.key$)|(\.p12$)|(\.pfx$)|(^id_)|(credential)|(secret)|(token)/i;
 // Any file on this computer may go to the phone (owner's choice), except the hub's own folder and secret-looking names:
 // every folder below the project is checked, or the whole path for a file outside it.
 export const unsendable = (real, root, hub = HOME) => inside(hub, real) ? '在 Hub 自己的目录里，不能发送'
