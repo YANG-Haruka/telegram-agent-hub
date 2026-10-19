@@ -3167,6 +3167,17 @@ export async function askQuestions(input, where, ask, other = async () => null, 
   }
   return Object.keys(answers).length ? answers : null;
 }
+// Desktop question / permission cards still waiting: {file, size, end}. Checked with the mirror tick.
+const deskCards = new Set();
+function deskCardsMovedOn() {
+  for (const c of deskCards) {
+    let st; try { st = fs.statSync(c.file); } catch { continue; }
+    if (st.size <= c.size) continue;
+    const n = Math.min(st.size - c.size, 8 * 1048576), b = Buffer.alloc(n), fd = fs.openSync(c.file, 'r');
+    try { fs.readSync(fd, b, 0, n, st.size - n); } finally { fs.closeSync(fd); }
+    if (b.includes('"type":"user"')) { deskCards.delete(c); c.end(); }
+  }
+}
 const freeText = new Map(); // "chatId:threadId" → resolve(text): an "其他" answer being typed there
 const waitFreeText = (chatId, threadId) => new Promise(res => { freeText.get(`${chatId}:${threadId ?? ''}`)?.(null); freeText.set(`${chatId}:${threadId ?? ''}`, res); });
 async function onDesktopPermission(req, gone) {
@@ -3175,7 +3186,7 @@ async function onDesktopPermission(req, gone) {
   if ([...live].some(([k, s]) => s.busy && state.topics[k]?.sessionId === req.session_id) || state.paused) return {};
   const where = `${path.basename(req.cwd || '') || '?'} · ${String(req.session_id || '').slice(0, 8)}`;
   const tk = Object.keys(state.topics).find(k => state.topics[k].sessionId === req.session_id && !state.topics[k].deleted && !state.topics[k].closed);
-  let timer, wid, over = false;
+  let timer, wid, over = false, card;
   const tt = tk && state.topics[tk]; if (tt) { tt.deskAsk = true; statusSoon(tk, 0); } // 🔴 while the card waits
   const ask = (html, opts, vertical = false) => over ? Promise.resolve(null) : tk // its topic, else 上朝
     ? askButtons(state.topics[tk].chatId, state.topics[tk].threadId, html, opts, vertical, { onId: id => { wid = id; } })
@@ -3196,8 +3207,14 @@ async function onDesktopPermission(req, gone) {
     const end = note => { over = true; if (wid) finishWait(wid, -1, note); freeText.get(`${ch}:${th ?? ''}`)?.(null); freeText.delete(`${ch}:${th ?? ''}`); res(null); };
     timer = setTimeout(() => end('⌛ 已超时，请回电脑上处理'), HOOK_WAIT);
     gone?.addEventListener('abort', () => end('💻 已在电脑上处理'), { once: true }); // stopped / answered there: the hook call went away
+    // Answered (or passed over by typing something else) in the desktop app: Claude Code doesn't cancel this hook call, so the
+    // card would wait its whole timeout. A new user line in its transcript (the answer, or what was typed instead) ends it.
+    const file = req.transcript_path || (tt && transcriptPath(tt));
+    let size = -1; try { size = fs.statSync(file).size; } catch {}
+    if (size >= 0) deskCards.add(card = { file, size, end: () => end('💻 已在电脑上处理') });
   });
   const v = await Promise.race([flow, timeout]).finally(() => {
+    deskCards.delete(card);
     if (tt) { delete tt.deskAsk; statusSoon(tk, 0); }
     const fk = `${ch}:${th ?? ''}`; freeText.get(fk)?.(null); freeText.delete(fk); // answered by a tap: the next message there is a message again
   });
@@ -3506,7 +3523,7 @@ if (IS_MAIN) {
   // A desktop card waiting on the previous process died with it (the desktop asks there again): no 🔴 left behind.
   for (const t of Object.values(state.topics)) if (t.deskAsk) delete t.deskAsk;
   save();
-  setInterval(() => mirrorDesktop().catch(e => log('mirror failed', e)), 20e3);
+  setInterval(() => { try { deskCardsMovedOn(); } catch (e) { log('desk cards check failed', e.message); } mirrorDesktop().catch(e => log('mirror failed', e)); }, 20e3);
   setInterval(() => deskStatus().catch(e => log('desk status failed', e)), 30e3);
   setInterval(() => autoSync().catch(e => log('auto sync failed', e)), 60e3);
   process.on('exit', () => {
