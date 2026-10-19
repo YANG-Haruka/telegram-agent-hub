@@ -583,3 +583,12 @@ test('Codex desktop rollout: turns → exchanges; a running turn shows what the 
   assert.deepEqual([fin.ex, fin.open], [[{ user: '再看看 JAL', reply: 'JAL 也行', who: 'Codex' }], undefined]);
   assert.deepEqual(codexScan(Buffer.from(L('event_msg', { type: 'task_started' }) + msg('x') + L('event_msg', { type: 'turn_aborted' }))).ex, []);
 });
+
+test('desktop mirror: a huge turn read from its middle still posts its answer and quick replies', () => {
+  const L = o => JSON.stringify(o) + '\n';
+  const wrap = { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '做好了', ask: '要中文版吗？', actions: [{ label: '加中文版', message: '再加中文版。' }] } };
+  const buf = Buffer.from(['{"partial line of a cut screenshot', L({ type: 'assistant', message: { content: [wrap] } }), L({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'w', content: '' }] } })].join('\n'));
+  const r = mirrorScan(buf, true, true);
+  assert.deepEqual(r.ex.map(e => [e.noUser, e.reply, e.actions?.[0].label]), [[true, '做好了\n要中文版吗？', '加中文版']]);
+  assert.deepEqual(mirrorScan(buf, true).ex, []); // not cut: a stray answer is a late write of a turn already posted
+});

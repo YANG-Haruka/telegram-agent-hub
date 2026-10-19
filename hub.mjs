@@ -944,7 +944,7 @@ function statusSoon(k, ms = 1500) {
   statusTimers.set(k, setTimeout(async () => {
     const t = state.topics[k], s = live.get(k);
     if (!t || t.isDispatcher || t.deleted || t.closed || !t.threadId) return;
-    const st = s?.waiting || t.deskAsk || t.webWait ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : s?.bg || deskBg.has(t.sessionId) ? 'bg' : 'done';
+    const st = s?.waiting || t.deskAsk || t.webWait || mirrorCards.has(k) ? 'ask' : t.busy || deskBusy.has(t.sessionId) ? 'run' : s?.bg || deskBg.has(t.sessionId) ? 'bg' : 'done';
     t.status = st;
     const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
     if (name === (t.shownName ?? t.title)) return;
@@ -1645,7 +1645,8 @@ function onDesktopPrompt(req) {
 // the next user message. Tool calls / results and subagents are left out. auto: a task notification's turn (the session woke
 // up by itself) is an exchange too, with no user side — unless it came mid-turn (the open exchange has no answer yet).
 export function exchanges(msgs, n = 4, auto = false) {
-  const out = []; let cur = null; // answers to an untyped turn (a task notification…) belong to no exchange
+  // auto 'cut' (the mirror read only a huge growth's last MB): the read starts inside a turn, whose answer still counts, with no user side.
+  const out = []; let cur = auto === 'cut' ? { user: '', noUser: true, reply: '', head: true } : null; if (cur) out.push(cur); // answers to an untyped turn (a task notification…) belong to no exchange
   for (const m of msgs) {
     if (m.parent_tool_use_id) continue;
     const c = m.message?.content, blocks = typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : [];
@@ -1653,7 +1654,7 @@ export function exchanges(msgs, n = 4, auto = false) {
     const text = blocks.map(b => b.type === 'text' ? b.text : b.type === 'tool_use' && /wrap_up$/.test(b.name) && b.input?.recap ? [b.input.recap, b.input.ask].filter(Boolean).join('\n') : '').filter(Boolean).join('\n').trim();
     if (m.type === 'user' && blocks.length && !blocks.some(b => b.type === 'tool_result')) {
       if (!NOT_TYPED.test(text)) out.push(cur = { user: text.replace(HUB_WRAP, '') || '（图片 / 文件）', reply: '' });
-      else if (auto && /^\s*<task-notification>/.test(text)) { if (!cur || cur.reply) out.push(cur = { user: '', auto: true, reply: '' }); }
+      else if (auto && /^\s*<task-notification>/.test(text)) { if (!cur || cur.reply || cur.head) out.push(cur = { user: '', auto: true, reply: '' }); }
       else cur = null;
     }
     else if (m.type === 'assistant' && text && cur) {
@@ -1662,7 +1663,7 @@ export function exchanges(msgs, n = 4, auto = false) {
       if (acts?.length) cur.actions = acts.filter(a => a?.label && a?.message).slice(0, 6); // the card's quick replies
     }
   }
-  return out.filter(Boolean).slice(-n);
+  return out.filter(e => e && !(e.head && !e.reply)).slice(-n);
 }
 // Desktop → topic mirror: the bytes a transcript grew by → the exchanges finished in them (answered ones only) and how many
 // bytes they used up. Same rows getSessionMessages keeps (no meta / sidechain lines); a partial last line is never used. The
@@ -1672,7 +1673,7 @@ export function exchanges(msgs, n = 4, auto = false) {
 // Files the desktop session showed the owner with its send-file tool (SendUserFile): [{ paths, caption }].
 const sentFiles = m => m.type !== 'assistant' || !Array.isArray(m.message?.content) ? [] : m.message.content
   .filter(b => b.type === 'tool_use' && /(^|__)SendUserFile$/.test(b.name) && Array.isArray(b.input?.files)).map(b => ({ paths: b.input.files, caption: b.input.caption || '' }));
-export function mirrorScan(buf, settled) {
+export function mirrorScan(buf, settled, cut = false) {
   const rows = [], end = buf.lastIndexOf(10) + 1;
   for (let at = 0, nl; (nl = buf.indexOf(10, at)) >= 0; at = nl + 1) {
     let m; try { m = JSON.parse(buf.toString('utf8', at, nl)); } catch { continue; }
@@ -1683,7 +1684,7 @@ export function mirrorScan(buf, settled) {
   // A message with no answer of its own but a later one after it (sent mid-turn, answered together) is kept; a lone
   // unanswered one (interrupted) is not.
   const done = (ex, used, waiting = false) => {
-    const files = ex.flatMap(r => sentFiles(r.m)), all = exchanges(ex.map(r => r.m), Infinity, true);
+    const files = ex.flatMap(r => sentFiles(r.m)), all = exchanges(ex.map(r => r.m), Infinity, cut ? 'cut' : true);
     return { ex: all.filter((e, i) => e.reply || (!e.auto && all.slice(i + 1).some(x => !x.auto))), used, waiting, ...(files.length ? { files } : {}) };
   };
   if (li < 0 || !exchanges([rows[li].m], 1, true).length) return done(rows, end); // nothing is open (an interruption, a compaction…)
@@ -1930,11 +1931,11 @@ async function mirrorDesktop() {
       const from = Math.max(at, st.size - 8 * 1048576);
       const buf = Buffer.alloc(st.size - from), fd = fs.openSync(f, 'r');
       try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
-      let r = isCodex(t) ? codexScan(buf) : mirrorScan(buf, false);
+      let r = isCodex(t) ? codexScan(buf) : mirrorScan(buf, false, from > at);
       // Settled = no write for 30 s and not mid-turn on the desktop (a text block can sit there while a long tool call streams).
       if (r.waiting && Date.now() - st.mtimeMs > 30e3) {
         running ??= new Set((await externalSessions()).filter(x => x.status === 'busy' || ['working', 'blocked'].includes(x.state)).map(x => x.sessionId));
-        if (!running.has(t.sessionId)) r = mirrorScan(buf, true);
+        if (!running.has(t.sessionId)) r = mirrorScan(buf, true, from > at);
       }
       // What the owner just said there (on the desktop or from the phone via Remote Control) shows up at once, not only
       // when that turn ends (a long-running session could hide it for hours); its exchange then posts the reply alone.
