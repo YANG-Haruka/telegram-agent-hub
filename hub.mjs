@@ -1979,7 +1979,14 @@ async function mirrorDesktop() {
       // The hub may have bound / run something here while `claude agents` ran: that moved the offset, drop this read.
       if (!r.used || t.mirrorAt !== at || t.mirrorSid !== t.sessionId || t.busy) { if (t.mirrorAt === at) await announce(); continue; }
       for (const e of r.ex) if (e.user && e.user === t.mirrorAnnounced) { e.noUser = true; delete t.mirrorAnnounced; } // already shown
-      t.mirrorAt = from + r.used; save();
+      t.mirrorAt = from + r.used;
+      // Claude Code's compaction writes the messages it keeps once more after its boundary (new uuids, same content): what
+      // this topic was already shown (by content) is not posted again. ponytail: the last 300 per topic.
+      const seen = new Set(t.mirrorSeen || []), kOf = x => crypto.createHash('sha1').update(JSON.stringify(x)).digest('hex').slice(0, 16);
+      r.ex = r.ex.filter(e => !seen.has(kOf([e.user, e.reply])));
+      r.files = (r.files || []).filter(f => !seen.has(kOf(f)));
+      t.mirrorSeen = [...seen, ...r.ex.map(e => kOf([e.user, e.reply])), ...r.files.map(kOf)].slice(-300); save();
+      if (!r.ex.length && !r.files.length) { await announce(); continue; }
       if (from > at) await send(t.chatId, t.threadId, '🖥 桌面上新增了很多内容（含大量图片），下面是最近的几轮，更早的用 /history 看', { disable_notification: true });
       const idle = live.get(k); if (r.ex.length && idle && !idle.busy) closeLive(k); // the desktop moved on: our process remembers less
       closeMirrorCard(k, '💻 已在桌面上回复'); // the desktop moved on: an older card's buttons would answer a stale question
