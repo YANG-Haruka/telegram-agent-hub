@@ -1838,7 +1838,14 @@ const claudeGroups = () => Object.entries(CFG.groups).filter(([, g]) => g.owner 
 const CODEX_HOME = () => process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 let rollouts = { at: 0, map: new Map() };
 function codexRollouts() {
-  if (Date.now() - rollouts.at < 600e3) return rollouts.map;
+  if (Date.now() - rollouts.at < 600e3) { // between full rebuilds: today's and yesterday's folders, where new threads appear
+    for (const day of [0, 1]) {
+      const d = new Date(Date.now() - day * 864e5), dir = path.join(CODEX_HOME(), 'sessions', String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'));
+      let es = []; try { es = fs.readdirSync(dir); } catch {}
+      for (const n of es) { const m = /([0-9a-f]{8}-[0-9a-f-]{27}).jsonl$/i.exec(n); if (m && !rollouts.map.has(m[1])) rollouts.map.set(m[1], path.join(dir, n)); }
+    }
+    return rollouts.map;
+  }
   const map = new Map(), walk = (d, depth) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory() && depth < 3) walk(p, depth + 1); else { const m = /([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i.exec(e.name); if (m) map.set(m[1], p); } } };
   walk(path.join(CODEX_HOME(), 'sessions'), 0);
