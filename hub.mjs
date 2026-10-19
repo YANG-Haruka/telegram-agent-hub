@@ -64,7 +64,10 @@ const ENV = mergeEnv(fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8')
 const CFG = JSON.parse(fs.readFileSync(fs.existsSync(CFG_FILE) ? CFG_FILE : path.join(HOME, 'examples', 'config.windows.json'), 'utf8'));
 const OWNER = Number(ENV.OWNER_ID);
 const STATE_FILE = path.join(HOME, 'state.json');
-const INBOX = path.join(HOME, 'inbox');
+// Files sent from the phone: <inboxDir>/<thread>/<time>-<id>.<ext>, outside the hub folder so agents in any project can read
+// them (the secret guard blocks every .agent-hub path). Kept inboxDays, the whole folder capped at inboxMaxGB (oldest go first).
+const INBOX = path.resolve(CFG.inboxDir || (process.platform === 'win32' ? 'F:\\TelegramInbox' : path.join(os.homedir(), 'TelegramInbox')));
+const INBOX_DAYS = CFG.inboxDays ?? 3, INBOX_MAX = (CFG.inboxMaxGB ?? 2) * 2 ** 30;
 const STALE_SEC = 15 * 60;
 const MAX_UP = 50 * 1024 * 1024, MAX_DOWN = 20 * 1024 * 1024;
 
@@ -924,6 +927,10 @@ async function deskStatus() {
   if (CFG.topicStatus === false || state.paused) return;
   const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
   deskBusy = new Set(rows.filter(r => r.status === 'busy' || r.state === 'working').map(r => r.sessionId));
+  // A session whose own turn ended but whose side sessions (start_session / hand-offs: spawnedFrom in the sidebar) still work
+  // is working too: 🟡 on its topic. Two levels up is plenty.
+  { const side = Object.values(sidebarRows()).flat(), cliOf = new Map(side.map(r => [r.local, r.cliSessionId]));
+    for (let i = 0; i < 2; i++) for (const r of side) if (r.parent && deskBusy.has(r.cliSessionId) && cliOf.get(r.parent)) deskBusy.add(cliOf.get(r.parent)); }
   for (const t of Object.values(state.topics)) if (isCodex(t) && t.sessionId && !t.deleted) { const f = codexRollout(t.sessionId); if (f && codexBusy(f)) deskBusy.add(t.sessionId); }
   const running = new Set(rows.map(r => r.sessionId)); // a closed process took its background tasks with it
   deskBg = new Set();
@@ -1349,7 +1356,7 @@ function noteAuth(t, bad) {
 // config agents[x].tokenIssued ("YYYY-MM-DD", optional): warned 30 and 7 days before the token's 1-year expiry.
 export const tokenDaysLeft = (issued, now = Date.now()) => Math.ceil((Date.parse(issued) + 365 * 86400e3 - now) / 86400e3);
 // Once a day (and at start): transcript retention and token expiry.
-// Phone photos / files in inbox/ and daily logs are kept 30 days (audit-*.log for good); leftover temp move / import / update
+// Daily logs are kept 30 days (audit-*.log for good); leftover temp move / import / update
 // folders (a crash mid-way) go after a day.
 function pruneOld(dir, days, keep = /^audit-/) {
   try {
@@ -1360,6 +1367,31 @@ function pruneOld(dir, days, keep = /^audit-/) {
     }
   } catch (e) { if (e.code !== 'ENOENT') log('prune failed', dir, e.message); }
 }
+// Hourly (and at start): files older than `days` go, then the oldest until the folder is under `max` bytes, then empty topic folders.
+// Only regular files strictly inside root are touched (symlinks are skipped, never followed); a drive / filesystem root is refused.
+export function cleanInbox(root, days, max, now = Date.now()) {
+  root = path.resolve(root);
+  if (path.parse(root).root === root) throw new Error(`inbox ${root} is a filesystem root, not cleaning it`);
+  const files = [], dirs = [], gone = [];
+  const walk = d => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (!inside(root, p) || p === root) continue;
+      if (e.isDirectory()) { dirs.push(p); walk(p); } else if (e.isFile()) { const st = fs.statSync(p); files.push({ p, t: st.mtimeMs, n: st.size }); }
+    }
+  };
+  if (!fs.existsSync(root)) return gone;
+  walk(root);
+  files.sort((a, b) => a.t - b.t);
+  let total = files.reduce((s, f) => s + f.n, 0);
+  for (const f of files) {
+    if (now - f.t <= days * 86400e3 && total <= max) break;
+    try { fs.rmSync(f.p); total -= f.n; gone.push(f.p); } catch (e) { log('inbox clean failed', f.p, e.message); }
+  }
+  for (const d of dirs.reverse()) try { if (!fs.readdirSync(d).length) fs.rmdirSync(d); } catch {}
+  return gone;
+}
+const cleanInboxNow = () => { try { const n = cleanInbox(INBOX, INBOX_DAYS, INBOX_MAX).length; if (n) log(`inbox: removed ${n} old file(s)`); } catch (e) { log('inbox clean failed', e.message); } };
 function pruneTemp() {
   try {
     for (const n of fs.readdirSync(os.tmpdir())) if (/^(agent-hub-(move|import|update|idx|get|screen|shot)-|mac-bundle-)/.test(n)) {
@@ -1371,7 +1403,7 @@ function pruneTemp() {
 function dailyChecks() {
   if (state.checkedOn === dayKey()) return;
   state.checkedOn = dayKey(); save();
-  pruneOld(INBOX, 30); pruneOld(path.join(HOME, 'logs'), 30); pruneTemp();
+  pruneOld(path.join(HOME, 'logs'), 30); pruneTemp();
   // Claude Code deletes transcripts idle longer than cleanupPeriodDays (default 30): an old topic would come back without its memory.
   let days; try { days = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'settings.json'), 'utf8').replace(/^﻿/, '')).cleanupPeriodDays; } catch {}
   if (!(days >= 365)) notifyOwner(`⚠️ ${CFG.machine}：~/.claude/settings.json 的 cleanupPeriodDays ${days == null ? '没设（默认 30 天）' : `是 ${days}`}。Claude Code 会删掉超过这个天数没动过的对话记录，放久了的话题就接不上、记忆也没了。建议加上 "cleanupPeriodDays": 3650。`);
@@ -2520,7 +2552,7 @@ function readSidebar(dir) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
       else if (/^local_.*\.json$/.test(e.name)) {
-        try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (!j.isArchived && j.cliSessionId && j.cwd) rows.push({ cliSessionId: j.cliSessionId, title: j.title || '', cwd: j.cwd, lastActivityAt: j.lastActivityAt || 0, createdAt: j.createdAt || 0 }); } catch {}
+        try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (!j.isArchived && j.cliSessionId && j.cwd) rows.push({ cliSessionId: j.cliSessionId, title: j.title || '', cwd: j.cwd, lastActivityAt: j.lastActivityAt || 0, createdAt: j.createdAt || 0, local: j.sessionId, parent: j.spawnedFrom?.sessionId }); } catch {}
       }
     }
   };
@@ -2729,12 +2761,13 @@ export function fileBlock(b, mime = '', claude = true) {
 async function download(fileId, threadId, name) {
   const f = await bot.api.getFile(fileId);
   if (f.file_size > MAX_DOWN) throw new Error('文件超过 20MB，Telegram 不允许 bot 下载');
-  const dir = path.join(INBOX, String(threadId)); fs.mkdirSync(dir, { recursive: true });
+  const dir = path.join(INBOX, String(threadId));
   const ext = path.extname(name || f.file_path || '').replace(/[^.\w]/g, '').slice(0, 8);
   const dest = path.join(dir, `${Date.now()}-${crypto.randomBytes(3).toString('hex')}${ext}`);
   const r = await fetch(`https://api.telegram.org/file/bot${ENV.TELEGRAM_BOT_TOKEN}/${f.file_path}`, { signal: AbortSignal.timeout(120e3) });
   if (!r.ok) throw new Error(`下载失败（HTTP ${r.status}），请重发`); // else the error JSON would be saved (and a photo sent to the agent) as the file
-  fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+  const data = Buffer.from(await r.arrayBuffer());
+  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(dest, data); // mkdir after the await: the cleaner may remove an empty folder meanwhile
   return dest;
 }
 
@@ -3406,6 +3439,7 @@ function sealEnv() {
 
 // ---------- startup ----------
 if (IS_MAIN) {
+  fs.mkdirSync(INBOX, { recursive: true }); cleanInboxNow(); setInterval(cleanInboxNow, 60 * 60e3);
   setInterval(() => { dailyChecks(); dailyUpdate().catch(e => log('update failed', e)); }, 20 * 60e3);
   setInterval(() => { for (const [k, s] of live) if (reapable(s, Date.now())) { log('closing idle session', state.topics[k]?.title); closeLive(k); } }, 5 * 60e3);
   // Watchdog: if long polling stalls (dead socket, outage) for 3 min, restart just the poller. Exit for a restart by Task
