@@ -1145,8 +1145,10 @@ async function endTurn(k, err) {
   const turn = { reportTo: s.reportTo, replyTo: s.replyTo, origin: s.origin, depth: s.depth, assigned: s.assigned, nudged: s.nudged, handedOff: s.handedOff, handedTo: s.handedTo, afterTurn: s.afterTurn, limited: s.limited, lastBuf: s.buf.trim() };
   // Files and the end snapshot too: a message arriving while the answer is sent starts the next turn, which changes files.
   const files = t.isDispatcher || CFG.autoSendFiles !== true ? [] : turnFiles(t.cwd, s.turnStart || Date.now(), t.outputs, s.sentFiles), before = s.before, after = snapTree(s, t);
-  if (!t.isDispatcher && !isCodex(t) && s.lastUuid && t.sessionId) // what Telegram said, for the desktop (and a later branch here)
-    t.tgLog = [...(t.tgLog || []).filter(e => e.sid === t.sessionId), { sid: t.sessionId, at: Date.now(), leaf: s.lastUuid, user: s.turnText.replace(HUB_WRAP, '').slice(0, 1500), reply: s.buf.trim().slice(0, 3000) }].slice(-10);
+  // what Telegram said, for the desktop (and a later branch here): turns someone asked for, not the session waking itself
+  // (those crowded the owner's decisions out of the log); the last 20.
+  if (!t.isDispatcher && !isCodex(t) && s.lastUuid && t.sessionId && s.turnText !== '（后台任务结束后自己接着做）' && !NOT_TYPED.test(s.turnText || ''))
+    t.tgLog = [...(t.tgLog || []).filter(e => e.sid === t.sessionId), { sid: t.sessionId, at: Date.now(), leaf: s.lastUuid, user: s.turnText.replace(HUB_WRAP, '').slice(0, 1500), reply: s.buf.trim().slice(0, 3000) }].slice(-20);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
   s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save(); statusSoon(k);
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
