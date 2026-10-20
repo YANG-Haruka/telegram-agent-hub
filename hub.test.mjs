@@ -37,9 +37,9 @@ test('outputs are recorded only after a successful tool_result', () => {
 });
 
 test('session card: folder, context, limits, model, effort, mode', () => {
-  const t = { title: 'project-x', cwd: 'D:/work/project-x', outputs: ['D:/work/project-x/a.js'] };
+  const t = { title: 'management', cwd: 'F:/workspace/Corpy/management', outputs: ['F:/workspace/Corpy/management/a.js'] };
   const c = renderCard(t, { ctx: 53, bg: 1, limits: ['⏱ 5h   x', '📅 Week y'], mcp: [{ status: 'connected' }] }).split('\n');
-  assert.equal(c[0], '📁 project-x · D:/work/project-x');
+  assert.equal(c[0], '📁 management · F:/workspace/Corpy/management');
   assert.match(c[1], /^🧠 Context ▓{5}░{5} 53%$/);
   assert.deepEqual(c.slice(2, 4), ['⏱ 5h   x', '📅 Week y']);
   assert.match(c[4], /^🤖 Model/);
@@ -54,10 +54,10 @@ test('chunks split long text under the Telegram limit', () => {
   assert.equal(parts.join('\n').replace(/\n+/g, '').length, 5000);
 });
 test('inside rejects escapes and prefix look-alikes', () => {
-  assert.ok(inside('D:/work/a', 'D:/work/a/b.png'));
-  assert.ok(!inside('D:/work/a', 'D:/work/a2/b.png'));
-  assert.ok(!inside('D:/work/a', 'D:/work/a/../b'));
-  assert.ok(!inside('D:/work/a', 'C:/Windows'));
+  assert.ok(inside('F:/workspace/a', 'F:/workspace/a/b.png'));
+  assert.ok(!inside('F:/workspace/a', 'F:/workspace/a2/b.png'));
+  assert.ok(!inside('F:/workspace/a', 'F:/workspace/a/../b'));
+  assert.ok(!inside('F:/workspace/a', 'C:/Windows'));
 });
 test('renderTool escapes HTML and shows a diff for Edit', () => {
   const h = renderTool('Edit', { file_path: 'x.js', old_string: 'a<b', new_string: 'a>b' });
@@ -85,21 +85,21 @@ test('model line', () => {
 
 import { rewriteProjectPath } from './hub.mjs';
 test('move rewrites Windows project paths to the Mac path (escaped, slash, sub-paths, any case)', () => {
-  const W = 'D:\\work\\project-y', M = '/Users/you/workspace/project-y';
-  const src = JSON.stringify({ cwd: W, file: W + '\\src\\a.ts', x: 'd:/work/project-y/b.md', other: 'D:\\work\\Other\\c' });
+  const W = 'F:\\workspace\\HaruYukaFlow', M = '/Users/h/workspace/HaruYukaFlow';
+  const src = JSON.stringify({ cwd: W, file: W + '\\src\\a.ts', x: 'f:/workspace/HaruYukaFlow/b.md', other: 'F:\\workspace\\Other\\c' });
   const out = JSON.parse(rewriteProjectPath(src, W, M)); // must still be valid JSON
-  assert.deepEqual(out, { cwd: M, file: M + '/src/a.ts', x: M + '/b.md', other: 'D:\\work\\Other\\c' });
+  assert.deepEqual(out, { cwd: M, file: M + '/src/a.ts', x: M + '/b.md', other: 'F:\\workspace\\Other\\c' });
   const back = JSON.parse(rewriteProjectPath(JSON.stringify({ cwd: M, file: M + '/src/a.ts' }), M, W)); // Mac → Windows
   assert.deepEqual(back, { cwd: W, file: W + '\\src\\a.ts' });
 });
 
 import { parseAlias, routeMachine, mergeHeartbeat } from './hub.mjs';
 test('上朝 addressing: nicknames, keywords, default', () => {
-  const aliases = { a: { machine: 'Windows', group: 1 }, mac: { machine: 'Mac', group: 4 } };
+  const aliases = { mine: { machine: 'Windows', group: 1 }, mac: { machine: 'Mac', group: 4 } };
   const route = { Mac: '(^|[^a-z])mac([^a-z]|$)|麦克|苹果' };
-  assert.deepEqual(parseAlias('@a 帮我查一下', aliases), { machine: 'Windows', group: 1, alias: 'a', rest: '帮我查一下' });
+  assert.deepEqual(parseAlias('@mine 帮我查一下', aliases), { machine: 'Windows', group: 1, alias: 'mine', rest: '帮我查一下' });
   assert.equal(parseAlias('@mac：新建项目', aliases).rest, '新建项目');
-  assert.equal(parseAlias('@a帮我查一下', aliases).rest, '帮我查一下'); // ASCII nickname: Chinese right after it is the task
+  assert.equal(parseAlias('@mine帮我查一下', aliases).rest, '帮我查一下'); // ASCII nickname: Chinese right after it is the task
   assert.equal(parseAlias('帮我查一下', aliases), null);
   assert.equal(parseAlias('mac 跑测试', aliases), null); // the @ is required
   assert.equal(parseAlias('Mac users: paste this into Terminal', aliases), null);
@@ -120,14 +120,14 @@ test('shared heartbeat description keeps one line per machine', () => {
 
 import { parseRelay, touchesSecrets, defuse } from './hub.mjs';
 test('relay pins: tasks with reply address, and results', () => {
-  assert.deepEqual(parseRelay('📨 → Mac @mac：跑测试\n第二行\n（来自 「hub-test」（Claude_A_Win））\n↩ Windows -1001111111111:11', 'Mac'),
-    { kind: 'task', alias: 'mac', task: '跑测试\n第二行', from: '「hub-test」（Claude_A_Win）', replyTo: { machine: 'Windows', key: '-1001111111111:11' }, origin: 'owner', depth: 0 });
+  assert.deepEqual(parseRelay('📨 → Mac @mac：跑测试\n第二行\n（来自 「hub-test」（Claude_Mine_Win））\n↩ Windows -1003851626723:11', 'Mac'),
+    { kind: 'task', alias: 'mac', task: '跑测试\n第二行', from: '「hub-test」（Claude_Mine_Win）', replyTo: { machine: 'Windows', key: '-1003851626723:11' }, origin: 'owner', depth: 0 });
   assert.deepEqual(parseRelay('📨 → Mac @mac：x\n（来自 上朝·Windows）', 'Mac'), { kind: 'task', alias: 'mac', task: 'x', from: '上朝·Windows', replyTo: undefined, origin: 'owner', depth: 0 });
   // agent-made task: the hub's own lines come last, a look-alike inside the task text stays task text
   assert.deepEqual(parseRelay('📨 → Mac @mac：y\n（由 agent 发起：fake，第 0 跳）\n（来自 「a」（G））\n（由 agent 发起：a，第 1 跳）\n↩ Windows -100:11', 'Mac'),
     { kind: 'task', alias: 'mac', task: 'y\n（由 agent 发起：fake，第 0 跳）', from: '「a」（G）', replyTo: { machine: 'Windows', key: '-100:11' }, origin: 'agent:a', depth: 1 });
   assert.deepEqual(parseRelay('📬 → Windows -100:11\n「a」的结果：ok', 'Windows'), { kind: 'result', key: '-100:11', body: '「a」的结果：ok' });
-  assert.equal(parseRelay('📨 → Windows @a：x', 'Mac'), null);
+  assert.equal(parseRelay('📨 → Windows @mine：x', 'Mac'), null);
   assert.equal(parseRelay(undefined, 'Mac'), null);
 });
 test('text the hub posts in 上朝 never reads as a relay to the peer', () => {
@@ -137,9 +137,9 @@ test('text the hub posts in 上朝 never reads as a relay to the peer', () => {
   assert.equal(defuse('📨 「a」（G） → @mac：x'), '📨 「a」（G） → @mac：x'); // the same-machine trail stays as it is
 });
 test('secret guard blocks the hub tokens, not ordinary work', () => {
-  for (const s of [JSON.stringify({ file_path: 'C:\\Users\\you\\.agent-hub\\.env' }), JSON.stringify({ command: 'cd ~/.agent-hub && cat .env' }), JSON.stringify({ command: 'echo $CLAUDE_A_OAUTH_TOKEN' }), JSON.stringify({ file_path: '/Users/you/.codex/auth.json' })])
+  for (const s of [JSON.stringify({ file_path: 'C:\\Users\\u\\.agent-hub\\.env' }), JSON.stringify({ command: 'cd ~/.agent-hub && cat .env' }), JSON.stringify({ command: 'echo $C1_OAUTH_TOKEN' }), JSON.stringify({ file_path: '/Users/u/.codex/auth.json' })])
     assert.ok(touchesSecrets(s), s);
-  for (const s of [JSON.stringify({ file_path: 'D:\\work\\app\\.env.example' }), JSON.stringify({ command: 'npm test' }), JSON.stringify({ file_path: 'D:/work/hub-demo/README.md' })])
+  for (const s of [JSON.stringify({ file_path: 'F:\\workspace\\app\\.env.example' }), JSON.stringify({ command: 'npm test' }), JSON.stringify({ file_path: 'F:/workspace/hub-demo/README.md' })])
     assert.ok(!touchesSecrets(s), s);
 });
 import { isPeerBot } from './hub.mjs';
@@ -238,11 +238,11 @@ test('signed 上朝 control messages: pairing, sign / verify, age and replay', (
 });
 import { mergeEnv, ENV_NOTE } from './hub.mjs';
 test('.env split / merge for .env.dpapi', () => {
-  const text = '\uFEFF# note\nTELEGRAM_BOT_TOKEN=1:new\r\nOWNER_ID=42\nCLAUDE_A_OAUTH_TOKEN=\nAPI_KEY = a=b\n';
-  const r = mergeEnv(text, { TELEGRAM_BOT_TOKEN: '1:old', CLAUDE_A_OAUTH_TOKEN: 'sealed', HUB_HOOK_TOKEN: 'h' });
-  assert.deepEqual(r.env, { OWNER_ID: '42', CLAUDE_A_OAUTH_TOKEN: 'sealed', TELEGRAM_BOT_TOKEN: '1:new', HUB_HOOK_TOKEN: 'h', API_KEY: 'a=b' }); // plaintext wins, empty doesn't
+  const text = '\uFEFF# mine\nTELEGRAM_BOT_TOKEN=1:new\r\nOWNER_ID=42\nC1_OAUTH_TOKEN=\nAPI_KEY = a=b\n';
+  const r = mergeEnv(text, { TELEGRAM_BOT_TOKEN: '1:old', C1_OAUTH_TOKEN: 'sealed', HUB_HOOK_TOKEN: 'h' });
+  assert.deepEqual(r.env, { OWNER_ID: '42', C1_OAUTH_TOKEN: 'sealed', TELEGRAM_BOT_TOKEN: '1:new', HUB_HOOK_TOKEN: 'h', API_KEY: 'a=b' }); // plaintext wins, empty doesn't
   assert.deepEqual(r.plain, { TELEGRAM_BOT_TOKEN: '1:new', API_KEY: 'a=b' });
-  assert.equal(r.rest, `${ENV_NOTE}\n# note\nOWNER_ID=42\nCLAUDE_A_OAUTH_TOKEN=\n`);
+  assert.equal(r.rest, `${ENV_NOTE}\n# mine\nOWNER_ID=42\nC1_OAUTH_TOKEN=\n`);
   const again = mergeEnv(r.rest, { ...r.plain }); // idempotent: nothing left to move, note not doubled
   assert.deepEqual(again.plain, {}); assert.equal(again.rest, r.rest); assert.equal(again.env.TELEGRAM_BOT_TOKEN, '1:new');
   assert.deepEqual(mergeEnv('K_TOKEN=YWJj==\n').env, { K_TOKEN: 'YWJj==' }); // .env.dpapi lines keep base64 padding
@@ -360,7 +360,6 @@ test('/screen and /shot arguments; blank captures detected', () => {
   assert.ok(looksBlank(png(1440, 900, Buffer.alloc(1440 * 900 * 3)))); // all black
   assert.ok(!looksBlank(png(1440, 900, crypto.randomBytes(1440 * 900 * 3).subarray(0, 300000)))); // real content barely compresses
 });
-
 import { exchanges, introHtml, historyMd } from './hub.mjs';
 test('recap: typed user turns and the final assistant text per exchange; noise left out', () => {
   const u = c => ({ type: 'user', parent_tool_use_id: null, message: { content: c } });
@@ -393,7 +392,6 @@ test('recap: typed user turns and the final assistant text per exchange; noise l
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(introHtml('h', [{ user: `${'a'.repeat(399)}😀`, reply: '' }]))); // cut never splits an emoji
   assert.match(historyMd('p', [{ user: 'q', reply: '' }]), /^# p：最近 1 轮对话\n\n## 1\n\n\*\*你：\*\*\n\nq\n\n\*\*Claude：\*\*\n\n（没有文字回复）$/);
 });
-
 import { mirrorScan, mirrorHtml } from './hub.mjs';
 test('desktop mirror: new transcript bytes → finished exchanges and the bytes they used', () => {
   const L = o => JSON.stringify(o) + '\n', B = (...ls) => Buffer.from(ls.join(''));
@@ -444,7 +442,6 @@ test('desktop mirror: new transcript bytes → finished exchanges and the bytes 
   assert.equal(mirrorHtml({ user: '<a>', reply: 'b&c' }), '🖥 桌面：\n<b>你：</b>&lt;a&gt;\n<b>Claude：</b>b&amp;c');
   assert.ok(mirrorHtml({ user: 'q', reply: '<'.repeat(9000) }).length <= 4000);
 });
-
 import { DESKTOP_APP } from "./hub.mjs";
 test("takeover only touches CLI processes the Claude desktop app started", () => {
   for (const p of [String.raw`C:\Program Files\WindowsApps\Claude_2.42304.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe`, "/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"])
@@ -452,14 +449,12 @@ test("takeover only touches CLI processes the Claude desktop app started", () =>
   for (const p of [String.raw`C:\Program Files\PowerShell\7\pwsh.exe`, String.raw`C:\Users\u\.local\bin\claude.exe`, String.raw`C:\Program Files\nodejs\node.exe`, "/bin/zsh", "/usr/local/bin/node", ""])
     assert.ok(!DESKTOP_APP.test(p), p);
 });
-
 import { STATUS_MARKS, stripMark } from './hub.mjs';
 test('topic status marks come off a renamed title', () => {
   for (const m of Object.values(STATUS_MARKS)) assert.equal(stripMark(m + 'my-project'), 'my-project');
   assert.equal(stripMark('my-project'), 'my-project');
   assert.equal(stripMark('🟡 🟢 x'), '🟢 x'); // one mark only: a title may itself start with an emoji
 });
-
 import { missingTg, recapText } from './hub.mjs';
 test('telegram turns a branch lacks; their recap never shows as the user message', () => {
   const L = (uuid, parentUuid, type = 'assistant', extra = {}) => JSON.stringify({ uuid, parentUuid, type, ...extra });
@@ -473,7 +468,6 @@ test('telegram turns a branch lacks; their recap never shows as the user message
   assert.deepEqual(exchanges([{ type: 'user', message: { content: [{ type: 'text', text: r }, { type: 'text', text: '这是用户布置的任务，直接开始做：真正的问题' }] } }, { type: 'assistant', message: { content: [{ type: 'text', text: '好' }] } }]),
     [{ user: '真正的问题', reply: '好' }]);
 });
-
 import { askQuestions } from './hub.mjs';
 test('a desktop option card becomes buttons; taps become the answers', async () => {
   const input = { questions: [{ question: '用哪个方案？', options: [{ label: 'A', description: '快' }, { label: 'B' }] }, { question: '现在发吗？', multiSelect: true, options: [{ label: '发' }, { label: '等等' }] }] };
@@ -486,7 +480,6 @@ test('a desktop option card becomes buttons; taps become the answers', async () 
   assert.equal(await askQuestions(input, 'p', () => Promise.resolve(null)), null); // timed out
   assert.equal(await askQuestions({}, 'p', () => Promise.resolve('0')), null);
 });
-
 import { bgScan } from './hub.mjs';
 test('background tasks a session left running: started by a tool result, finished by its notification', () => {
   const L = o => JSON.stringify(o);
@@ -504,7 +497,6 @@ test('a tool output quoting another session\'s background line is not a backgrou
   const real = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: [{ type: 'text', text: 'Command running in background with ID: ok1. Output is being written to: f' }] }] } });
   assert.deepEqual([...bgScan([quote, real].join('\n'))], ['ok1']);
 });
-
 import { hubCodeOnly, pendingWebCall } from './hub.mjs';
 test('hub-admin topics may touch the hub code, never its secrets', () => {
   for (const ok of [String.raw`C:\Users\u\.agent-hub\hub.mjs`, 'cd ~/.agent-hub && node --test hub.test.mjs', '~/.agent-hub/RULES.md'])
@@ -530,7 +522,6 @@ test('the site a stuck browser agent was on: the last navigated URL', () => {
   assert.equal(lastHost(t), 'shop.example.com');
   assert.equal(lastHost('{"input":{"text":"no url"}}'), '');
 });
-
 test('desktop mirror carries the files the session sent the owner', () => {
   const L = o => JSON.stringify(o) + '\n';
   const buf = Buffer.from([L({ type: 'user', message: { content: '对比一下' } }),
@@ -541,7 +532,6 @@ test('desktop mirror carries the files the session sent the owner', () => {
   assert.deepEqual(r.ex, [{ user: '对比一下', reply: '发了' }]);
   assert.deepEqual(r.files, [{ paths: ['a.jpg', 'b.jpg'], caption: '对比图' }]);
 });
-
 test('desktop option card: "其他" takes a typed answer', async () => {
   const input = { questions: [{ question: '用哪个方案？', options: [{ label: 'A' }, { label: 'B' }] }] };
   let opts;
@@ -558,7 +548,6 @@ test('desktop option card: text typed while the card is open is the answer', asy
   assert.deepEqual(await askQuestions(input, 'p', ask, async () => null, typed, t => closed.push(t)), { Q1: '我自己写的', Q2: 'B' });
   assert.deepEqual(closed, ['我自己写的']);
 });
-
 test('desktop quick replies (wrap_up actions) ride along with the mirrored answer', () => {
   const L = o => JSON.stringify(o) + '\n';
   const wrap = { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '查完了', ask: '按两批重训？', actions: [{ label: '两批都训', message: '8 个按两批重训。' }, { label: '只训第一批', message: '先训第一批。' }, { label: 'x' }] } };
@@ -567,7 +556,6 @@ test('desktop quick replies (wrap_up actions) ride along with the mirrored answe
   assert.equal(r.ex[0].reply, '查完了\n按两批重训？');
   assert.deepEqual(r.ex[0].actions, [{ label: '两批都训', message: '8 个按两批重训。' }, { label: '只训第一批', message: '先训第一批。' }]);
 });
-
 import { codexScan } from './hub.mjs';
 test('Codex desktop rollout: turns → exchanges; a running turn shows what the owner said', () => {
   const L = (type, payload) => JSON.stringify({ type, payload }) + '\n';
@@ -583,7 +571,6 @@ test('Codex desktop rollout: turns → exchanges; a running turn shows what the 
   assert.deepEqual([fin.ex, fin.open], [[{ user: '再看看 JAL', reply: 'JAL 也行', who: 'Codex' }], undefined]);
   assert.deepEqual(codexScan(Buffer.from(L('event_msg', { type: 'task_started' }) + msg('x') + L('event_msg', { type: 'turn_aborted' }))).ex, []);
 });
-
 test('desktop mirror: a huge turn read from its middle still posts its answer and quick replies', () => {
   const L = o => JSON.stringify(o) + '\n';
   const wrap = { type: 'tool_use', id: 'w', name: 'mcp__ccd_turn__wrap_up', input: { recap: '做好了', ask: '要中文版吗？', actions: [{ label: '加中文版', message: '再加中文版。' }] } };
@@ -591,4 +578,43 @@ test('desktop mirror: a huge turn read from its middle still posts its answer an
   const r = mirrorScan(buf, true, true);
   assert.deepEqual(r.ex.map(e => [e.noUser, e.reply, e.actions?.[0].label]), [[true, '做好了\n要中文版吗？', '加中文版']]);
   assert.deepEqual(mirrorScan(buf, true).ex, []); // not cut: a stray answer is a late write of a turn already posted
+});
+
+import { cleanInbox } from './hub.mjs';
+import fsT from 'node:fs'; import osT from 'node:os'; import pathT from 'node:path';
+test('inbox cleaner: old files, then oldest over the cap, empty topic folders; nothing outside the root', () => {
+  const base = fsT.mkdtempSync(pathT.join(osT.tmpdir(), 'inbox-test-')), root = pathT.join(base, 'inbox'), outside = pathT.join(base, 'keep.log');
+  const put = (rel, ageDays, size = 10) => { const p = pathT.join(root, rel); fsT.mkdirSync(pathT.dirname(p), { recursive: true }); fsT.writeFileSync(p, Buffer.alloc(size)); const t = new Date(Date.now() - ageDays * 86400e3); fsT.utimesSync(p, t, t); return p; };
+  fsT.writeFileSync(outside, 'x'); fsT.utimesSync(outside, new Date(0), new Date(0));
+  const old = put('140/old.log', 4), fresh1 = put('171/a.log', 1, 60), fresh2 = put('171/b.log', 0.5, 60);
+  assert.deepEqual(cleanInbox(root, 3, 1000), [old]);
+  assert.ok(!fsT.existsSync(pathT.join(root, '140')) && fsT.existsSync(fresh1) && fsT.existsSync(outside));
+  assert.deepEqual(cleanInbox(root, 3, 100), [fresh1]); // 120 bytes > 100: the older one goes
+  assert.ok(fsT.existsSync(fresh2) && fsT.existsSync(root));
+  assert.throws(() => cleanInbox(pathT.parse(base).root, 3, 0));
+  fsT.rmSync(base, { recursive: true, force: true });
+});
+
+test('mirrorScan skips the hub own turn lines, keeps a desktop turn open across them', () => {
+  const L = (type, entrypoint, content, extra = {}) => JSON.stringify({ type, entrypoint, message: { role: type, content, ...extra } });
+  const buf = Buffer.from([
+    L('user', 'claude-desktop', '做复仇游戏'),
+    L('user', 'sdk-ts', '手机上问的'),
+    L('assistant', 'sdk-ts', [{ type: 'text', text: '手机这边的回答' }], { stop_reason: 'end_turn' }),
+    L('assistant', 'claude-desktop', [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }]),
+  ].join('\n') + '\n');
+  const r = mirrorScan(buf, false);
+  assert.equal(r.open, '做复仇游戏'); assert.equal(r.ex.length, 0); assert.equal(r.used, 0);
+  const done = Buffer.concat([buf, Buffer.from(L('assistant', 'claude-desktop', [{ type: 'text', text: '做好了' }], { stop_reason: 'end_turn' }) + '\n')]);
+  const d = mirrorScan(done, false);
+  assert.deepEqual(d.ex.map(e => [e.user, e.reply]), [['做复仇游戏', '做好了']]);
+});
+
+test('mirrorScan cut read inside a running turn waits for its end', () => {
+  const L = (type, content, extra = {}) => JSON.stringify({ type, entrypoint: 'claude-desktop', message: { role: type, content, ...extra } });
+  const mid = Buffer.from(['{"cut', L('assistant', [{ type: 'text', text: '正在打开工作台' }]), L('assistant', [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }])].join('\n') + '\n');
+  assert.deepEqual(mirrorScan(mid, false, true), { ex: [], used: 0, waiting: false });
+  const fin = Buffer.concat([mid, Buffer.from(L('assistant', [{ type: 'text', text: '都看完了' }], { stop_reason: 'end_turn' }) + '\n')]);
+  const r = mirrorScan(fin, false, true);
+  assert.equal(r.ex.length, 1); assert.equal(r.ex[0].reply, '都看完了'); assert.ok(r.ex[0].noUser);
 });

@@ -1229,7 +1229,7 @@ function wroteElsewhere(t) {
     const buf = Buffer.alloc(Math.min(size - t.mirrorAt, 4 * 1048576)), fd = fs.openSync(f, 'r');
     try { fs.readSync(fd, buf, 0, buf.length, t.mirrorAt); } finally { fs.closeSync(fd); }
     const msgs = buf.toString('utf8').split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } })
-      .filter(m => (m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain);
+      .filter(m => (m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain && m.entrypoint !== HUB_ENTRY);
     return exchanges(msgs, 1, true).length > 0;
   } catch { return false; }
 }
@@ -1719,11 +1719,12 @@ export function exchanges(msgs, n = 4, auto = false) {
 // Files the desktop session showed the owner with its send-file tool (SendUserFile): [{ paths, caption }].
 const sentFiles = m => m.type !== 'assistant' || !Array.isArray(m.message?.content) ? [] : m.message.content
   .filter(b => b.type === 'tool_use' && /(^|__)SendUserFile$/.test(b.name) && Array.isArray(b.input?.files)).map(b => ({ paths: b.input.files, caption: b.input.caption || '' }));
+const HUB_ENTRY = 'sdk-ts'; // transcript lines the hub's own turns write (Agent SDK); the topic already shows those
 export function mirrorScan(buf, settled, cut = false) {
   const rows = [], end = buf.lastIndexOf(10) + 1;
   for (let at = 0, nl; (nl = buf.indexOf(10, at)) >= 0; at = nl + 1) {
     let m; try { m = JSON.parse(buf.toString('utf8', at, nl)); } catch { continue; }
-    if ((m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain && !m.teamName) rows.push({ at, m });
+    if ((m?.type === 'user' || m?.type === 'assistant') && !m.isMeta && !m.isSidechain && !m.teamName && m.entrypoint !== HUB_ENTRY) rows.push({ at, m });
   }
   const blocks = m => { const c = m.message?.content; return typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []; };
   let li = -1; rows.forEach((r, i) => { const b = blocks(r.m); if (r.m.type === 'user' && b.length && !b.some(x => x.type === 'tool_result')) li = i; }); // exchanges()' turn start
@@ -1733,6 +1734,13 @@ export function mirrorScan(buf, settled, cut = false) {
     const files = ex.flatMap(r => sentFiles(r.m)), all = exchanges(ex.map(r => r.m), Infinity, cut ? 'cut' : true);
     return { ex: all.filter((e, i) => e.reply || (!e.auto && all.slice(i + 1).some(x => !x.auto))), used, waiting, ...(files.length ? { files } : {}) };
   };
+  if (li < 0 && cut && rows.length) { // the read starts inside a turn (its start is further back): only post once it has ended
+    const last = rows.at(-1).m, lb = blocks(last), wr = b => b.type === 'tool_use' && /wrap_up$/.test(b.name);
+    const wraps = new Set(rows.flatMap(r => blocks(r.m).filter(wr).map(b => b.id)));
+    const onAnswer = last.type === 'assistant' ? lb.some(b => b.type === 'text' && b.text?.trim() || wr(b)) && !lb.some(b => b.type === 'tool_use' && !wr(b))
+      : lb.length > 0 && lb.every(b => b.type === 'tool_result' && wraps.has(b.tool_use_id));
+    if (!(onAnswer && (settled || last.message?.stop_reason === 'end_turn'))) return { ex: [], used: 0, waiting: onAnswer };
+  }
   if (li < 0 || !exchanges([rows[li].m], 1, true).length) return done(rows, end); // nothing is open (an interruption, a compaction…)
   const tail = rows.slice(li), last = tail.at(-1).m, lb = blocks(last), wrap = b => b.type === 'tool_use' && /wrap_up$/.test(b.name);
   const wraps = new Set(tail.flatMap(r => blocks(r.m).filter(wrap).map(b => b.id)));
@@ -1945,8 +1953,16 @@ const transcriptPath = t => path.join(os.homedir(), '.claude', 'projects', t.cwd
 // turn on it, so only what happened elsewhere is posted; a new / changed session or an unknown offset starts at the end (no backfill).
 function markMirror(t) {
   if (!t?.sessionId || t.isDispatcher) return;
-  try { t.mirrorAt = fs.statSync(mirrorFile(t)).size; } catch { delete t.mirrorAt; }
-  t.mirrorSid = t.sessionId;
+  let size; try { size = fs.statSync(mirrorFile(t)).size; } catch { delete t.mirrorAt; t.mirrorSid = t.sessionId; return; }
+  // The desktop wrote here meanwhile (a turn it started while the hub ran its own, maybe still running): stay put, so the
+  // mirror still posts it (it skips the hub's own lines). Jumping to the end lost that turn's answer.
+  if (!isCodex(t) && t.mirrorSid === t.sessionId && t.mirrorAt != null && size > t.mirrorAt) {
+    const from = Math.max(t.mirrorAt, size - 8 * 1048576), buf = Buffer.alloc(size - from), fd = fs.openSync(mirrorFile(t), 'r');
+    try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+    for (const l of buf.toString('utf8').split('\n')) { let m; try { m = JSON.parse(l); } catch { continue; }
+      if ((m.type === 'user' || m.type === 'assistant') && !m.isSidechain && m.entrypoint && m.entrypoint !== HUB_ENTRY) return; }
+  }
+  t.mirrorAt = size; t.mirrorSid = t.sessionId;
 }
 let mirroring = false;
 // The desktop card's quick replies ("两批都训" …) as buttons under the mirrored answer. A tap = the owner sending that
@@ -3527,6 +3543,18 @@ if (IS_MAIN) {
   // The list stays in state until onStart, so an instance that dies before reaching Telegram doesn't forget them.
   state.interrupted = [...new Set([...(state.interrupted || []), ...Object.entries(state.topics).filter(([, t]) => t.busy).map(([k]) => k)])];
   for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
+  // Once: a desktop turn already shown in a topic (mirrorAnnounced) whose offset an old hub moved past at its own turn's end —
+  // back to that line, so its answer still gets posted (seen hashes stop repeats).
+  if (state.mirrorRewindV !== 1) { state.mirrorRewindV = 1;
+    for (const t of Object.values(state.topics)) { if (!t.mirrorAnnounced || isCodex(t) || t.mirrorSid !== t.sessionId || t.mirrorAt == null) continue;
+      try { const f = transcriptPath(t), from = Math.max(0, t.mirrorAt - 64 * 1048576), buf = Buffer.alloc(t.mirrorAt - from), fd = fs.openSync(f, 'r');
+        try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+        for (let end = buf.length; end > 1; ) { const st = buf.lastIndexOf(10, end - 2) + 1; let m; try { m = JSON.parse(buf.toString('utf8', st, end)); } catch {}
+          const c = m?.message?.content, txt = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(b => b.type === 'text').map(b => b.text).join('\n') : '';
+          if (m?.type === 'user' && m.entrypoint !== HUB_ENTRY && txt.trim() === t.mirrorAnnounced) { log('mirror rewound to an announced desktop turn', t.sessionId, t.mirrorAt - from - st); t.mirrorAt = from + st; break; }
+          end = st; }
+      } catch {} }
+    save(); }
   // A desktop card waiting on the previous process died with it (the desktop asks there again): no 🔴 left behind.
   for (const t of Object.values(state.topics)) if (t.deskAsk) delete t.deskAsk;
   save();
