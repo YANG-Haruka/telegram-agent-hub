@@ -973,10 +973,14 @@ export const dumpsEnv = c => /\bprintenv\b|\b(Get-ChildItem|gci|ls|dir|Get-Item)
 // config hubAdminTopics: topic keys where the owner works on the hub itself — its folder is allowed there, but never its
 // secrets (.env*, state.json with the pairing key), login files, token variables or environment dumps.
 export const hubCodeOnly = s => s.replace(/\.agent-hub(?![\\/]+(\.env|state\.json))/gi, '·hub');
+// The project keys the sessions do get (user environment, e.g. CIVITAI_API_TOKEN): named in the denial, so an agent stopped
+// from listing the environment still knows to use $NAME (one that didn't went on without its key and got a 401).
+const PROJECT_KEYS = Object.keys(process.env).filter(n => SECRET_ENV.test(n) && !(n in ENV) && !/^(CLAUDE|ANTHROPIC|TELEGRAM|HUB_)/i.test(n) && !touchesSecrets(n)).sort();
 const secretGuard = k => async input => {
   const s = JSON.stringify(input.tool_input || {}), admin = (CFG.hubAdminTopics || []).includes(k);
+  const keys = PROJECT_KEYS.length ? `项目用的令牌已经在环境变量里，直接在命令里用 $名字 即可（不要打印出来）：${PROJECT_KEYS.join('、')}。` : '';
   return touchesSecrets(admin ? hubCodeOnly(s) : s) || dumpsEnv(input.tool_input?.command)
-    ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: admin ? 'Hub 的密钥、登录文件和环境变量不允许读取或修改（Hub 的代码可以）。' : 'Hub 的目录、密钥、登录文件和环境变量不允许读取或修改。' } }
+    ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: (admin ? 'Hub 的密钥、登录文件和环境变量不允许读取或修改（Hub 的代码可以）。' : 'Hub 的目录、密钥、登录文件和环境变量不允许读取或修改。') + keys } }
     : {};
 };
 // The rule in PHONE_PROMPT sits after Claude Code's long English system prompt and wore off in long turns: repeated as hidden
@@ -1273,7 +1277,9 @@ async function feed(k, content) {
   if (state.paused) { log('paused, not started', t?.title); return false; } // /panic: no resumes, results or relays start work
   let s = live.get(k);
   if (!s) {
-    if (await onDesktop(t) && !live.get(k)) await copyTopic(k); // an agent can't tap: copy without asking
+    // Open in the desktop app and idle there: carry on the same session, like an owner message. Mid-turn there or open in a
+    // terminal: copy (an agent can't tap the wait card).
+    if (await onDesktop(t) && !live.get(k) && (await desktopProc(t.sessionId))?.status !== 'idle' && !live.get(k)) await copyTopic(k);
     s = live.get(k) || startSession(k);
   }
   if (s.busy || s.queue.length) s.queue.push(content); else startTurn(k, content);
