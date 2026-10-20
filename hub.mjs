@@ -1208,7 +1208,7 @@ function switchAccount(k, acct) {
 const onDesktop = async t => !!t.sessionId && !isCodex(t) && (await externalSessions()).some(r => r.sessionId === t.sessionId);
 const DESKTOP_COPY = '📋 这个会话正在桌面 App 或终端里开着，已复制一份带完整记忆的副本在这里继续；桌面那边的对话不受影响。';
 // Owner messages go on with the same session even while the desktop app has it open (a CLI process that is a child of the
-// Claude app — never a terminal's or the hub's own): busy there → wait for that turn to end (6 h max), then run here.
+// Claude app — never a terminal's or the hub's own): busy there → wait for that turn to end (after a minute the owner may choose to go on at once), then run here.
 // The app continues from the last message it knows, so the two sides branch; tgRecap / onDesktopPrompt tell each side
 // what the other one said. false: not open in the app.
 export const DESKTOP_APP = /[\\/]WindowsApps[\\/]Claude_[^\\/]*[\\/]app[\\/]claude\.exe$|[\\/]Claude\.app[\\/]/i;
@@ -1238,15 +1238,22 @@ function desktopTakeover(k) {
   if (!takeovers.has(k)) takeovers.set(k, (async () => {
     const t = state.topics[k], wait = ms => new Promise(r => setTimeout(r, ms));
     if (!t.sessionId || isCodex(t)) return false;
-    // A desktop that stays busy (a long background task / workflow) once held messages here for hours: wait a minute at
-    // most, then go on anyway (the two branches are bridged by the recaps). No notice either way.
-    let seen = false;
-    for (const end = Date.now() + 60e3; ; await wait(10e3)) {
+    // Going on while the desktop still runs makes two parallel runs of one session doing different things; waiting silently
+    // once held messages for hours (a long background task / workflow). So: busy for over a minute → ask; the message runs
+    // when the desktop's turn ends, or at once if the owner taps "现在就做".
+    let seen = false, card, asked = false, now = false;
+    const close = note => card && finishWait(card, -1, note);
+    for (const start = Date.now(); ; await wait(10e3)) {
       const r = await desktopProc(t.sessionId);
-      if (!r) return seen; // not (or no longer) open in the app
+      if (!r) { close('💻 桌面那边已经关掉了，接着在这里做'); return seen; } // not (or no longer) open in the app
       seen = true;
-      if (r.status !== 'idle' && Date.now() < end) continue;
-      if (r.status !== 'idle') log('desktop still busy after 1 min, going on anyway', t.sessionId);
+      if (r.status !== 'idle' && !now) {
+        if (!asked && Date.now() - start > 60e3) asked = true, askButtons(t.chatId, t.threadId, '💻 这个会话在桌面上还在跑。你这条消息先等桌面这一轮跑完再做，免得两边同时干不同的事。',
+          [['⏳ 等桌面跑完（推荐）', 'wait'], ['▶️ 现在就在这里做（会和桌面分开跑）', 'now']], true, { onId: id => { card = id; } })
+          .then(v => { if (v === 'now') now = true; if (v) card = null; }).catch(() => {});
+        continue;
+      }
+      if (now) log('desktop busy, owner chose to go on', t.sessionId); else close('💻 桌面那一轮跑完了，接着在这里做');
       log('took over from the desktop app', t.sessionId); audit('takeover', t.chatId, t.threadId);
       return true;
     }
