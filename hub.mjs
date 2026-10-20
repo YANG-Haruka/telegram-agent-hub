@@ -1158,6 +1158,7 @@ async function endTurn(k, err) {
     t.tgLog = [...(t.tgLog || []).filter(e => e.sid === t.sessionId), { sid: t.sessionId, at: Date.now(), leaf: s.lastUuid, user: s.turnText.replace(HUB_WRAP, '').slice(0, 1500), reply: s.buf.trim().slice(0, 3000) }].slice(-20);
   Object.assign(s, { reportTo: null, replyTo: null, origin: null, depth: null, afterTurn: null, limited: null });
   s.buf = ''; s.busy = false; s.idleSince = Date.now(); t.busy = false; delete t.turnMeta; delete t.autoResumed; markMirror(t); save(); statusSoon(k);
+  if (!t.isDispatcher && !s.queue.length) reloadDesktop(t).catch(e => log('desktop reload failed', e.message));
   // /stop with steered messages maybe still in the CLI's input queue: close it now, before it can run them (the next message
   // resumes the transcript); whatever was queued since goes to the fresh session.
   if (s.closeAfter) { const q = s.queue.splice(0); closeLive(k); (async () => { for (const c of q) await feed(k, c); })().catch(e => log('requeue failed', e)); }
@@ -1223,6 +1224,18 @@ export async function desktopProc(sessionId) {
   const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? [] : JSON.parse(out)); } catch { res([]); } }));
   for (const r of rows) if (r.sessionId === sessionId && r.kind === 'interactive' && Number.isInteger(r.pid) && alive(r.pid) && DESKTOP_APP.test(await parentExe(r.pid))) return r;
   return null;
+}
+// After a Telegram turn the desktop app's process for this session still holds the conversation without it. Stopping that
+// process while idle, with no background tasks in the session (owner-approved 2026-10-20), makes the app load the
+// conversation again, Telegram turns included, when it is opened there next (tested: switching to it is enough).
+// Mid-turn / background tasks: left alone; the recap still tells it on its next prompt. config reloadDesktop: false = off.
+async function reloadDesktop(t) {
+  if (CFG.reloadDesktop === false || !t.sessionId || isCodex(t)) return;
+  bgTrack(t); if (t.bgOpen?.length) return;
+  const r = await desktopProc(t.sessionId);
+  if (r?.status !== 'idle' || t.busy) return;
+  process.kill(r.pid); t.deskSeen = Date.now(); save(); // the reloaded desktop has these turns: no recap of them
+  log('desktop process stopped so the app reloads', t.sessionId, r.pid);
 }
 // A turn started elsewhere (the desktop) after the hub's last one: transcript bytes past t.mirrorAt holding a typed (or
 // self-woken) user line. Not the hub's own trailing bookkeeping lines.
