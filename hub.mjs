@@ -2427,7 +2427,7 @@ async function selfTest() {
   } catch (e) { ok(false, `读不了 ~/.claude/settings.json：${e.message}`); }
   const rows = await new Promise(res => execFile(CLAUDE_EXE, ['agents', '--json'], { timeout: 20000, windowsHide: true }, (e, out) => { try { res(e ? null : JSON.parse(out)); } catch { res(null); } }));
   ok(!!rows, rows ? `claude agents：${rows.filter(r => r.kind === 'interactive').length} 个桌面 / 终端会话` : 'claude agents 跑不起来');
-  for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) { const n = readSidebar(c.sidebarDir).length; ok(n > 0, `${c.label} 侧边栏：${n} 个会话`); }
+  for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) { const n = readSidebar(sideDir(c)).length; ok(n > 0, `${c.label} 侧边栏：${n} 个会话`); }
   const ts = Object.values(state.topics).filter(t => !t.deleted && !t.isDispatcher);
   L.push(`📋 话题 ${ts.length} 个：${ts.map(t => t.shownName || t.title).join('、').slice(0, 600)}`);
   // Desktop → topic sync per topic: transcript size vs what the mirror has read, desktop process state, why it may be held.
@@ -2601,12 +2601,19 @@ export function partitionSidebar(byAgent) {
   for (const a in out) out[a].sort((x, y) => y.lastActivityAt - x.lastActivityAt);
   return out;
 }
+// The desktop app's sidebar folder. The Windows Store app moved its data (2026-10) from …\Packages\Claude_<id>\LocalCache\
+// Roaming\Claude to %LOCALAPPDATA%\Claude-Data\claude_<id>: a configured old path that is gone falls back to the new one.
+export function sideDir(c, exists = fs.existsSync) {
+  const d = c.sidebarDir.replace(/^~(?=$|[\\/])/, os.homedir()), m = /Packages[\\/]Claude_([^\\/]+)[\\/]/i.exec(d);
+  if (m && !exists(d)) { const n = path.join(os.homedir(), 'AppData', 'Local', 'Claude-Data', `claude_${m[1]}`, 'claude-code-sessions'); if (exists(n)) return n; }
+  return d;
+}
 // Sessions archived in the desktop app (isArchived in its sidebar) and Codex threads moved to ~/.codex/archived_sessions.
 function archivedSessions() {
   const ids = new Set();
   const walk = d => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/^local_.*.json$/.test(e.name)) try { const j = JSON.parse(fs.readFileSync(p, 'utf8')); if (j.isArchived && j.cliSessionId) ids.add(j.cliSessionId); } catch {} } };
-  for (const c of Object.values(CFG.agents)) if (c.sidebarDir) walk(c.sidebarDir.replace(/^~(?=$|[\/])/, os.homedir()));
+  for (const c of Object.values(CFG.agents)) if (c.sidebarDir) walk(sideDir(c));
   try { for (const n of fs.readdirSync(path.join(CODEX_HOME(), 'archived_sessions'))) { const m = /([0-9a-f]{8}-[0-9a-f-]{27}).jsonl/i.exec(n); if (m) ids.add(m[1]); } } catch {}
   return ids;
 }
@@ -2627,7 +2634,7 @@ function readSidebar(dir) {
 // An agent's sidebar sessions without a topic (deleted topics count: a session whose topic you deleted stays out).
 function sidebarRows() {
   const byAgent = {};
-  for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) byAgent[a] = readSidebar(c.sidebarDir);
+  for (const [a, c] of Object.entries(CFG.agents)) if (c.sidebarDir) byAgent[a] = readSidebar(sideDir(c));
   return partitionSidebar(byAgent);
 }
 function unsynced(agent) {
