@@ -618,3 +618,12 @@ test('mirrorScan cut read inside a running turn waits for its end', () => {
   const r = mirrorScan(fin, false, true);
   assert.equal(r.ex.length, 1); assert.equal(r.ex[0].reply, '都看完了'); assert.ok(r.ex[0].noUser);
 });
+
+import { sidebarEntry } from './hub.mjs';
+test('sidebar entry: stable settings from the template, this session and nothing session-specific', () => {
+  const tpl = { model: 'claude-opus-5', effort: 'high', permissionMode: 'auto', bridgeSessionIds: ['x'], spawnSeed: {}, completedTurns: 9, title: 'old' };
+  const e = sidebarEntry(tpl, { sessionId: 'sid-1', cwd: '/w/p', title: '投影仪' }, 5, 'u1');
+  assert.equal(e.sessionId, 'local_u1'); assert.equal(e.cliSessionId, 'sid-1'); assert.equal(e.cwd, '/w/p'); assert.equal(e.title, '投影仪');
+  assert.equal(e.model, 'claude-opus-5'); assert.equal(e.isArchived, false); assert.equal(e.completedTurns, 0);
+  assert.ok(!('bridgeSessionIds' in e) && !('spawnSeed' in e));
+});

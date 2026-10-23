@@ -725,6 +725,7 @@ function agentEnv(agent) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDECODE|CLAUDE_CODE_(ENTRYPOINT|SESSION|OAUTH)|TELEGRAM_|ANTHROPIC_API_KEY)/.test(k)));
   const tok = ENV[CFG.agents[agent].tokenEnv];
   if (tok) env.CLAUDE_CODE_OAUTH_TOKEN = tok;
+  Object.assign(env, CFG.agents[agent].env || {}); // e.g. Claude Code on another model: ANTHROPIC_BASE_URL → a local claude-code-router
   return env;
 }
 
@@ -1040,6 +1041,7 @@ function startSession(k) {
             if (t.forkFrom) t.copyOf = t.forkFrom; // /sync: the original stays "already has a topic"
             t.sessionId = m.session_id; delete t.forkFrom; save();
             if (fresh) renameSession(m.session_id, `tg:${t.title}`).catch(() => {});
+            try { sidebarAdd(t); } catch (e) { log('sidebar add failed', e.message); }
           }
           if (m.model && t.modelActual !== m.model) { t.modelActual = m.model; save(); }
           refreshCardSoon(k);
@@ -2169,6 +2171,8 @@ async function importMove(m, doc, intoId, g) {
       t.sessionId = meta.sessionId; t.cwd = target; t.closed = false; delete t.movedTo; delete t.forkFrom; markMirror(t); save(); link = topicLink(t.chatId, t.threadId);
       await sendIntro(t, `📦 这个话题已切换到从 ${meta.from} 搬来的会话「${meta.title}」。`, await loadRecap(t, meta.sessionId), '直接发消息接着聊。');
     } else link = (await openProject(Number(intoId), g.agent, target)).link;
+    const moved = Object.values(state.topics).find(x => x.sessionId === meta.sessionId && !x.deleted); // in the desktop app here too
+    if (moved) try { sidebarAdd(moved); } catch (e) { log('sidebar add failed', e.message); }
     await send(CFG.exchange, exThread('todo'), `📦 已接收从 ${meta.from} 搬来的会话「${meta.title}」${link ? `：${link}` : ''}${codeMissing ? `\n⚠️ 这台电脑上原本没有项目目录，已新建空目录 ${target}。请先把代码同步过来（例如 git clone），否则它只有记忆没有文件。` : ''}`);
     log('imported move bundle', meta.title, '->', target);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); if (zip) fs.rmSync(zip, { force: true }); }
@@ -2607,6 +2611,29 @@ export function sideDir(c, exists = fs.existsSync) {
   const d = c.sidebarDir.replace(/^~(?=$|[\\/])/, os.homedir()), m = /Packages[\\/]Claude_([^\\/]+)[\\/]/i.exec(d);
   if (m && !exists(d)) { const n = path.join(os.homedir(), 'AppData', 'Local', 'Claude-Data', `claude_${m[1]}`, 'claude-code-sessions'); if (exists(n)) return n; }
   return d;
+}
+// A topic's session in its account's desktop sidebar, so the app lists it and can continue it (moved here from the other
+// machine, or started from Telegram). The sidebar is just one local_*.json per session in <account>/<org>/ (what the
+// claude-account-sync skill relies on too); the new entry copies the stable settings of the newest one there (the
+// logged-in account). The app reads new entries only when it starts (checked: not while running). Off until an app restart
+// confirms the entry works: config sidebarAdd: true turns it on.
+const SIDEBAR_KEEP = ['model', 'effort', 'permissionMode', 'remoteMcpServersConfig', 'chromePermissionMode', 'classifierSummaryEnabled', 'reportFindingsCard'];
+export function sidebarEntry(tpl, { sessionId, cwd, title }, now = Date.now(), id = crypto.randomUUID()) {
+  return { ...Object.fromEntries(SIDEBAR_KEEP.filter(k => k in tpl).map(k => [k, tpl[k]])), sessionId: `local_${id}`, cliSessionId: sessionId, cwd, originCwd: cwd,
+    lastFocusedAt: now, createdAt: now, lastActivityAt: now, isArchived: false, title, titleSource: 'user', completedTurns: 0, alwaysAllowedReasons: [], sessionPermissionUpdates: [] };
+}
+function sidebarAdd(t) {
+  const c = CFG.agents[t.agent];
+  if (CFG.sidebarAdd !== true || !c?.sidebarDir || !t.sessionId || t.isDispatcher || isCodex(t)) return;
+  let newest = null; const all = [];
+  const walk = d => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/^local_.*\.json$/.test(e.name)) { all.push(p); const m = fs.statSync(p).mtimeMs; if (!newest || m > newest.m) newest = { p, m }; } } };
+  walk(sideDir(c));
+  if (!newest) return; // no sidebar yet (never used the desktop app with this account)
+  for (const p of all) try { if (JSON.parse(fs.readFileSync(p, 'utf8')).cliSessionId === t.sessionId) return; } catch {}
+  const e = sidebarEntry(JSON.parse(fs.readFileSync(newest.p, 'utf8')), { sessionId: t.sessionId, cwd: t.cwd, title: t.title });
+  fs.writeFileSync(path.join(path.dirname(newest.p), `${e.sessionId}.json`), JSON.stringify(e));
+  log('added to the desktop sidebar', t.title, t.sessionId);
 }
 // Sessions archived in the desktop app (isArchived in its sidebar) and Codex threads moved to ~/.codex/archived_sessions.
 function archivedSessions() {
@@ -3571,6 +3598,8 @@ if (IS_MAIN) {
   for (const k of state.interrupted) if (state.topics[k]) { state.topics[k].busy = false; markMirror(state.topics[k]); } // the cut-off turn is the hub's own
   // Once: a desktop turn already shown in a topic (mirrorAnnounced) whose offset an old hub moved past at its own turn's end —
   // back to that line, so its answer still gets posted (seen hashes stop repeats).
+  // Once: the topics' sessions that are not in the desktop sidebar yet (moved here, or started from Telegram) get listed there.
+  if (CFG.sidebarAdd === true && state.sidebarV !== 1) { state.sidebarV = 1; for (const t of Object.values(state.topics)) if (!t.deleted && !t.closed) try { sidebarAdd(t); } catch (e) { log('sidebar add failed', e.message); } save(); }
   if (state.mirrorRewindV !== 1) { state.mirrorRewindV = 1;
     for (const t of Object.values(state.topics)) { if (!t.mirrorAnnounced || isCodex(t) || t.mirrorSid !== t.sessionId || t.mirrorAt == null) continue;
       try { const f = transcriptPath(t), from = Math.max(0, t.mirrorAt - 64 * 1048576), buf = Buffer.alloc(t.mirrorAt - from), fd = fs.openSync(f, 'r');
@@ -3598,6 +3627,8 @@ if (IS_MAIN) {
     if (started) return log('poller restarted');
     started = true;
     log(`hub started as @${me.username} v${HUB_VERSION}`);
+    // An agent's local helper (config agents.<id>.startCmd, e.g. "ccr start" for a claude-code-router): started once, left running.
+    for (const [id, a] of Object.entries(CFG.agents)) if (a.startCmd) try { childProcess.spawn(a.startCmd, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref(); log('started helper for', id); } catch (e) { log('helper failed', id, e.message); }
     if (state.recapV !== 2) { state.recapV = 2; for (const t of Object.values(state.topics)) delete t.deskSeen; save(); }
     syncGroupPhotos(true).catch(e => log('group photos failed', e.message));
     loadTopicIcon().then(async () => { if (!topicIconId) return; for (const t of Object.values(state.topics)) if (!t.deleted && !t.isDispatcher && t.threadId && t.iconId !== topicIconId && ownGroups().some(([id]) => id === String(t.chatId)))
