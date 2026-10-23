@@ -755,8 +755,8 @@ export function noteOutputs(t, msg, pend) {
   }
 }
 // Permission modes switchable from Telegram: only "ask" (every action needs a tap) and "auto" (classifier, ask when risky).
-export const MODES = { default: 'ask before every action', auto: 'auto-approve, ask only when risky' };
-const modeOf = t => t?.mode || state.groupModes?.[t?.chatId] || 'auto';
+export const MODES = { default: 'ask before every action', auto: 'auto-approve, ask only when risky', bypassPermissions: 'never ask (config only)' };
+const modeOf = t => t?.mode || state.groupModes?.[t?.chatId] || CFG.groups?.[String(t?.chatId)]?.mode || 'auto'; // config groups.<id>.mode: a group's default
 const modeLine = m => `⚙️ Mode: ${MODES[m]} (${m === 'default' ? 'ask' : m})`;
 
 // Models: per topic (/model in a topic), per group (/model in 圣旨), dispatcher defaults to Sonnet (routing only).
@@ -956,7 +956,10 @@ function statusSoon(k, ms = 1500) {
     t.status = st;
     const name = ((STATUS_MARKS[st] || '') + t.title).slice(0, 128);
     if (name === (t.shownName ?? t.title)) return;
-    await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => { t.shownName = name; save(); }, e => log('topic status failed', e.description || e.message));
+    // TOPIC_NOT_MODIFIED: Telegram already has this name, so it is shown. Kept as "not shown" before, the next status
+    // compared against a stale name and skipped a rename it needed (🟢 while the turn ran).
+    await bot.api.editForumTopic(t.chatId, t.threadId, { name }).then(() => { t.shownName = name; save(); },
+      e => { if (/TOPIC_NOT_MODIFIED/.test(e.description || '')) { t.shownName = name; save(); } else log('topic status failed', k, e.description || e.message); });
   }, ms));
 }
 
@@ -1004,7 +1007,7 @@ function startSession(k) {
     prompt: ch.iter(),
     options: {
       // /fork: first start copies the source session's full history into a new session id
-      cwd, resume: t.sessionId || t.forkFrom || undefined, forkSession: !t.sessionId && !!t.forkFrom, permissionMode: modeOf(t), model: modelOf(t),
+      cwd, resume: t.sessionId || t.forkFrom || undefined, forkSession: !t.sessionId && !!t.forkFrom, permissionMode: modeOf(t), ...(modeOf(t) === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}), model: modelOf(t),
       ...(effortOf(t) ? { effort: effortOf(t) } : {}), // dispatchers: routing only, Sonnet + low effort, never Opus
       // Dispatchers only route: an allowlist (no user settings, plugins or other MCP) so they can't "just do it" (and skip
       // confirmation / the project topic). 圣旨 keeps Glob (find project folders) + tg; 上朝 only picks the agent (send_to_agent).
@@ -2783,7 +2786,7 @@ async function cmdMode(chatId, threadId, k, arg) {
   let mode = pick[arg.toLowerCase()];
   const scope = k ? `话题「${state.topics[k].title}」` : '本群（没单独设置过的话题）';
   const cur = k ? modeOf(state.topics[k]) : (state.groupModes?.[chatId] || 'auto');
-  if (!mode) mode = await askButtons(chatId, threadId, `${esc(scope)}当前模式：<b>${cur === 'default' ? 'ask' : 'auto'}</b>\n选择新模式：`,
+  if (!mode) mode = await askButtons(chatId, threadId, `${esc(scope)}当前模式：<b>${cur === 'default' ? 'ask' : cur === 'bypassPermissions' ? 'bypass' : 'auto'}</b>\n选择新模式：`,
     [['🙋 ask：每个操作都问', 'default'], ['⚡ auto：有风险才问', 'auto']]);
   if (!mode) return;
   if (k) {
@@ -3628,7 +3631,12 @@ if (IS_MAIN) {
     started = true;
     log(`hub started as @${me.username} v${HUB_VERSION}`);
     // An agent's local helper (config agents.<id>.startCmd, e.g. "ccr start" for a claude-code-router): started once, left running.
-    for (const [id, a] of Object.entries(CFG.agents)) if (a.startCmd) try { childProcess.spawn(a.startCmd, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref(); log('started helper for', id); } catch (e) { log('helper failed', id, e.message); }
+    // With checkUrl it is checked every minute and started again when it stopped (it went down with the shell that ran it).
+    const helper = (id, a) => { try { childProcess.spawn(a.startCmd, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref(); log('started helper for', id); } catch (e) { log('helper failed', id, e.message); } };
+    for (const [id, a] of Object.entries(CFG.agents)) if (a.startCmd) {
+      helper(id, a);
+      if (a.checkUrl) setInterval(() => fetch(a.checkUrl, { signal: AbortSignal.timeout(5000) }).catch(() => helper(id, a)), 60e3);
+    }
     if (state.recapV !== 2) { state.recapV = 2; for (const t of Object.values(state.topics)) delete t.deskSeen; save(); }
     syncGroupPhotos(true).catch(e => log('group photos failed', e.message));
     loadTopicIcon().then(async () => { if (!topicIconId) return; for (const t of Object.values(state.topics)) if (!t.deleted && !t.isDispatcher && t.threadId && t.iconId !== topicIconId && ownGroups().some(([id]) => id === String(t.chatId)))
