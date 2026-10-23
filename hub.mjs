@@ -768,7 +768,9 @@ export const modelLine = (picked, actual) => `🤖 Model: ${modelLabel(picked)}$
 // Effort: dispatchers fixed low; Claude topics /effort, else config projectEffort, else not passed (model default);
 // Codex topics send it every turn (a thread otherwise keeps whatever its last turn used).
 export const EFFORTS = [['默认', 'default'], ['Low', 'low'], ['Medium', 'medium'], ['High', 'high'], ['XHigh', 'xhigh'], ['Max', 'max']];
-const isCodex = t => CFG.agents[t?.agent]?.type === 'codex' && !t?.isDispatcher;
+// "Not a Claude transcript": Codex and DeepSeek Harness topics (the Claude-only mirror, recap, sidebar … skip them).
+const isDsh = t => CFG.agents[t?.agent]?.type === 'dsh' && !t?.isDispatcher;
+const isCodex = t => ['codex', 'dsh'].includes(CFG.agents[t?.agent]?.type) && !t?.isDispatcher;
 export const effortOf = t => (t?.isDispatcher ? CFG.dispatcherEffort || 'low' : t?.effort || (isCodex(t) ? CFG.codexEffort || 'xhigh' : CFG.projectEffort)) || undefined;
 const codexTier = t => CFG.codexServiceTier === 'default' ? 'default' : t.tierActual; // undefined until the thread has started
 const effortLine = t => `🎚 Effort: ${effortOf(t) || '模型默认'}${t.ultracode && !isCodex(t) ? ' + Ultra' : ''}${t.effort ? '（你设的）' : ''}${isCodex(t) && codexTier(t) !== undefined ? ` · ${/^(priority|fast)$/.test(codexTier(t)) ? 'Fast' : '标准速度'}` : ''}`;
@@ -932,7 +934,7 @@ async function deskStatus() {
   // is working too: 🟡 on its topic. Two levels up is plenty.
   { const side = Object.values(sidebarRows()).flat(), cliOf = new Map(side.map(r => [r.local, r.cliSessionId]));
     for (let i = 0; i < 2; i++) for (const r of side) if (r.parent && deskBusy.has(r.cliSessionId) && cliOf.get(r.parent)) deskBusy.add(cliOf.get(r.parent)); }
-  for (const t of Object.values(state.topics)) if (isCodex(t) && t.sessionId && !t.deleted) { const f = codexRollout(t.sessionId); if (f && codexBusy(f)) deskBusy.add(t.sessionId); }
+  for (const t of Object.values(state.topics)) if (isCodex(t) && !isDsh(t) && t.sessionId && !t.deleted) { const f = codexRollout(t.sessionId); if (f && codexBusy(f)) deskBusy.add(t.sessionId); }
   const running = new Set(rows.map(r => r.sessionId)); // a closed process took its background tasks with it
   deskBg = new Set();
   for (const t of Object.values(state.topics)) if (t.sessionId && !t.isDispatcher && !t.deleted && !t.closed && !isCodex(t) && running.has(t.sessionId)) {
@@ -992,6 +994,7 @@ const secretGuard = k => async input => {
 const replyLanguage = async () => CFG.replyLanguage === '' ? {} : { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `提醒：这一轮给用户的每一句话（中途汇报、最后总结、表格都算）都用${CFG.replyLanguage || '中文'}，代码、命令、文件名、报错原文除外。` } };
 function startSession(k) {
   const t = state.topics[k];
+  if (isDsh(t)) return startDshSession(k);
   if (CFG.agents[t.agent]?.type === 'codex' && !t.isDispatcher) return startCodexSession(k);
   const ch = channel();
   const s = { push: ch.push, busy: false, waiting: 0, queue: [], buf: '', typing: null, pendEdits: new Map(), account: accountOf(t), idleSince: Date.now(), steerIds: new Set() };
@@ -1606,6 +1609,54 @@ function startCodexSession(k) {
   return s;
 }
 
+// ---------- DeepSeek Harness (dsh) topics: one `dsh headless --json` run per turn, resumed by session id ----------
+// The app's own node runs the CLI (no cmd.exe: it mangles quotes and backslashes in the task). The model, provider and
+// key come from the headless profile (~/.dsh/profiles/headless/cordis.patch.yml + the app's credential store).
+const DSH_APP = () => CFG.dshApp || path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'DeepSeek Harness');
+function startDshSession(k) {
+  const t = state.topics[k];
+  const s = { busy: false, waiting: 0, queue: [], buf: '', typing: null, pendEdits: new Map(), account: t.agent, dsh: true, idleSince: Date.now() };
+  let proc = null;
+  s.push = async msg => {
+    const parts = [];
+    for (const [i, b] of (msg.message.content || []).entries()) {
+      if (b.type === 'text') parts.push(b.text);
+      if (b.type === 'image') { const f = path.join(INBOX, String(t.threadId), `${Date.now()}-${i}.${b.source.media_type.split('/')[1].replace('jpeg', 'jpg')}`); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, Buffer.from(b.source.data, 'base64')); parts.push(`（图片已保存在 ${f}）`); }
+    }
+    if (CFG.replyLanguage !== '') parts.unshift(`（Hub：给用户的每一句话都用${CFG.replyLanguage || '中文'}，代码、命令、文件名、报错原文除外。）`);
+    const app = DSH_APP(), cli = path.join(app, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+    const args = ['--expose-internals', cli, 'headless', '--json', ...(t.sessionId ? ['--session-id', t.sessionId] : []), '-'];
+    let out = '', err = '', failed = '';
+    proc = childProcess.spawn(path.join(app, 'DeepSeek Harness.exe'), args, { cwd: t.cwd, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    proc.stdin.end(parts.join('\n\n')); // the task on stdin (`-`): any length, no quoting
+    proc.stdout.on('data', d => {
+      out += d;
+      for (let nl; (nl = out.indexOf('\n')) >= 0; out = out.slice(nl + 1)) {
+        let j; try { j = JSON.parse(out.slice(0, nl)); } catch { continue; }
+        if (j.type === 'session' && j.sessionId && t.sessionId !== j.sessionId) { t.sessionId = j.sessionId; save(); }
+        else if (j.type === 'status' && j.phase === 'step_start') { s.steps = (s.steps || 0) + 1; progressSoon(k); }
+        else if (j.type === 'status' && j.reason?.kind === 'error') failed = String(j.reason.error?.message || 'error');
+        else if (j.type === 'final' && j.text) s.buf += (s.buf ? '\n\n' : '') + j.text;
+      }
+    });
+    proc.stderr.on('data', d => { err = (err + d).slice(-2000); });
+    proc.on('error', e => { failed = e.message; });
+    proc.on('close', code => {
+      proc = null;
+      const why = failed || (code && !s.buf.trim() ? redact(err.trim().split('\n').pop() || `退出码 ${code}`) : '');
+      endTurn(k, why ? `⚠️ DeepSeek 这一轮没完成：${clip(why, 600)}` : '');
+    });
+  };
+  s.steer = async () => false; // no mid-turn input: queued for the next turn
+  s.q = {
+    interrupt: async () => { proc?.kill(); },
+    close: () => { proc?.kill(); },
+    setPermissionMode: async () => {}, setModel: async () => {}, getContextUsage: async () => null, mcpServerStatus: async () => [],
+  };
+  live.set(k, s);
+  return s;
+}
+
 // ---------- external sessions (desktop / terminal) via `claude agents --json` ----------
 // User's CLI if installed, else the binary bundled with the Agent SDK (Macs may only have the desktop app).
 const CLAUDE_EXE = (() => {
@@ -1827,7 +1878,7 @@ async function openProject(chatId, agent, p, { fresh = false } = {}) {
   let sessionId = null, forkFrom = null, sessions = [], codexPreview = '', where = '';
   const isCodex = CFG.agents[agent]?.type === 'codex';
   if (isCodex) { if (!fresh) { const th = await codexLatestThread(p); if (th) { sessions = [{ sessionId: th.id }]; codexPreview = th.name || th.preview || ''; } } }
-  else try { sessions = (await listSessions({ dir: p })).sort((a, b) => b.lastModified - a.lastModified); } catch {}
+  else if (CFG.agents[agent]?.type !== 'dsh') try { sessions = (await listSessions({ dir: p })).sort((a, b) => b.lastModified - a.lastModified); } catch {} // dsh: a topic starts its own Session
   if (!fresh) {
     let existing = Object.values(state.topics).find(t => t.chatId === chatId && norm(t.cwd) === norm(p) && !t.deleted && !t.isDispatcher);
     if (existing) { // reopenForumTopic doubles as an existence probe: open → TOPIC_NOT_MODIFIED, closed → reopened, deleted → TOPIC_ID_INVALID
@@ -1969,7 +2020,7 @@ function codexBusy(f) {
   } catch { return false; }
 }
 // The log the desktop mirror reads for a topic: Claude transcript or Codex rollout.
-const mirrorFile = t => isCodex(t) ? codexRollout(t.sessionId) : transcriptPath(t);
+const mirrorFile = t => isDsh(t) ? null : isCodex(t) ? codexRollout(t.sessionId) : transcriptPath(t);
 const transcriptPath = t => path.join(os.homedir(), '.claude', 'projects', t.cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${t.sessionId}.jsonl`);
 
 // ---------- desktop → topic mirror: what the owner does with a topic's session in the desktop app shows up in the topic ----------
