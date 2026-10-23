@@ -2615,16 +2615,16 @@ export function sideDir(c, exists = fs.existsSync) {
 // A topic's session in its account's desktop sidebar, so the app lists it and can continue it (moved here from the other
 // machine, or started from Telegram). The sidebar is just one local_*.json per session in <account>/<org>/ (what the
 // claude-account-sync skill relies on too); the new entry copies the stable settings of the newest one there (the
-// logged-in account). The app reads new entries only when it starts (checked: not while running). Off until an app restart
-// confirms the entry works: config sidebarAdd: true turns it on.
+// logged-in account). The app reads new entries only when it starts (checked 2026-10-23: after a restart it lists and
+// continues the session; not while running). config sidebarAdd: false turns it off.
 const SIDEBAR_KEEP = ['model', 'effort', 'permissionMode', 'remoteMcpServersConfig', 'chromePermissionMode', 'classifierSummaryEnabled', 'reportFindingsCard'];
 export function sidebarEntry(tpl, { sessionId, cwd, title }, now = Date.now(), id = crypto.randomUUID()) {
   return { ...Object.fromEntries(SIDEBAR_KEEP.filter(k => k in tpl).map(k => [k, tpl[k]])), sessionId: `local_${id}`, cliSessionId: sessionId, cwd, originCwd: cwd,
     lastFocusedAt: now, createdAt: now, lastActivityAt: now, isArchived: false, title, titleSource: 'user', completedTurns: 0, alwaysAllowedReasons: [], sessionPermissionUpdates: [] };
 }
 function sidebarAdd(t) {
-  const c = CFG.agents[t.agent];
-  if (CFG.sidebarAdd !== true || !c?.sidebarDir || !t.sessionId || t.isDispatcher || isCodex(t)) return;
+  const a = CFG.agents[t.agent], c = a?.sidebarDir ? a : CFG.agents[a?.desktopAccount]; // desktopAccount: list it in that account's app
+  if (CFG.sidebarAdd === false || !c?.sidebarDir || !t.sessionId || t.isDispatcher || isCodex(t)) return;
   let newest = null; const all = [];
   const walk = d => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/^local_.*\.json$/.test(e.name)) { all.push(p); const m = fs.statSync(p).mtimeMs; if (!newest || m > newest.m) newest = { p, m }; } } };
@@ -3599,7 +3599,7 @@ if (IS_MAIN) {
   // Once: a desktop turn already shown in a topic (mirrorAnnounced) whose offset an old hub moved past at its own turn's end —
   // back to that line, so its answer still gets posted (seen hashes stop repeats).
   // Once: the topics' sessions that are not in the desktop sidebar yet (moved here, or started from Telegram) get listed there.
-  if (CFG.sidebarAdd === true && state.sidebarV !== 1) { state.sidebarV = 1; for (const t of Object.values(state.topics)) if (!t.deleted && !t.closed) try { sidebarAdd(t); } catch (e) { log('sidebar add failed', e.message); } save(); }
+  if (CFG.sidebarAdd !== false && state.sidebarV !== 1) { state.sidebarV = 1; for (const t of Object.values(state.topics)) if (!t.deleted && !t.closed) try { sidebarAdd(t); } catch (e) { log('sidebar add failed', e.message); } save(); }
   if (state.mirrorRewindV !== 1) { state.mirrorRewindV = 1;
     for (const t of Object.values(state.topics)) { if (!t.mirrorAnnounced || isCodex(t) || t.mirrorSid !== t.sessionId || t.mirrorAt == null) continue;
       try { const f = transcriptPath(t), from = Math.max(0, t.mirrorAt - 64 * 1048576), buf = Buffer.alloc(t.mirrorAt - from), fd = fs.openSync(f, 'r');
